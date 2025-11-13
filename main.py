@@ -23,12 +23,10 @@ from db import (
     get_word_by_id,
 )
 
-
 # --- Проверка токена ---
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN.")
-
 
 # --- Инициализация бота и FastAPI-приложения ---
 
@@ -37,6 +35,10 @@ bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
 app = FastAPI()
+
+# --- Память: последнее слово, по которому был ответ (для кнопки "I was wrong") ---
+
+user_last_word: dict[int, int] = {}
 
 
 # --- Pydantic-модели для sync-эндпоинтов ---
@@ -56,15 +58,14 @@ class SyncWordsRequest(BaseModel):
 # --- Вспомогательная функция: текст вопроса + клавиатура ---
 
 def build_question_message(row) -> tuple[str, InlineKeyboardMarkup]:
-    """Готовим текст вопроса и клавиатуру для одного слова."""
+    """Текст вопроса и клавиатура для одного слова."""
     word_id = row["id"]
     progress = row["progress"]
     question = row["question"]
 
     text = (
-        f"❓ *Question*\n"
-        f"{question}\n\n"
-        f"📈 Current progress for this word: {progress}"
+        f"❓ {question}\n\n"
+        f"📈 Current progress: {progress}"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -77,6 +78,10 @@ def build_question_message(row) -> tuple[str, InlineKeyboardMarkup]:
                 InlineKeyboardButton(
                     text="❌ I don't know",
                     callback_data=f"ans:{word_id}:dont",
+                ),
+                InlineKeyboardButton(
+                    text="↩️ I was wrong",
+                    callback_data="ans:fix",
                 ),
             ]
         ]
@@ -95,8 +100,9 @@ async def cmd_start(message: types.Message):
         "Send /next to get the first card.\n\n"
         "For each card choose:\n"
         "• ✅ *I know* – if you remember the word\n"
-        "• ❌ *I don't know* – if you don't.\n\n"
-        "Based on your answers, words you know worse will appear more often."
+        "• ❌ *I don't know* – if you don't\n"
+        "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
+        "Words you know worse will appear more often."
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -112,11 +118,39 @@ async def cmd_next(message: types.Message):
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
-@dp.callback_query(F.data.startswith("ans:"))
+@dp.callback_query(F.data.startswith("ans"))
 async def handle_answer(callback: types.CallbackQuery):
-    """Пользователь нажал: I know / I don't know."""
+    """Обрабатываем: I know / I don't know / I was wrong."""
+    data = callback.data
+
+    # --- Кнопка "I was wrong": корректируем предыдущее слово ---
+    if data == "ans:fix":
+        user_id = callback.from_user.id
+        last_id = user_last_word.get(user_id)
+        if not last_id:
+            await callback.answer("No previous word to fix.", show_alert=False)
+            return
+
+        row = await get_word_by_id(last_id)
+        if not row:
+            await callback.answer("Previous word not found.", show_alert=False)
+            return
+
+        old_progress = row["progress"]
+        await decrement_progress(last_id)
+        new_progress = max(0, old_progress - 1)
+
+        text = (
+            "🔁 Previous word corrected.\n"
+            f"📉 Progress -1 = {new_progress}"
+        )
+        await callback.message.answer(text)
+        await callback.answer()
+        return
+
+    # --- Кнопки I know / I don't know ---
     try:
-        _, word_id_str, verdict = callback.data.split(":")
+        _, word_id_str, verdict = data.split(":")
         word_id = int(word_id_str)
     except Exception:
         await callback.answer("Something went wrong 🤷‍♂️", show_alert=False)
@@ -127,37 +161,35 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer("Word not found in the database.", show_alert=True)
         return
 
+    user_id = callback.from_user.id
+    user_last_word[user_id] = word_id  # запоминаем это слово как последнее
+
     old_progress = row["progress"]
 
-    # Обновляем прогресс
     if verdict == "know":
+        delta = 1
         await increment_progress(word_id)
-        new_progress = old_progress + 1
-        verdict_text = "✅ You marked this word as *known*."
-    else:
+    else:  # "dont"
+        delta = -1
         await decrement_progress(word_id)
-        new_progress = max(0, old_progress - 1)
-        verdict_text = "❌ You marked this word as *not known*."
+
+    new_progress = max(0, old_progress + delta)
+    sign = "+" if delta > 0 else "-"
 
     question = row["question"]
     answer = row["answer"]
     example = row["example"]
 
-    # Текст по предыдущему слову
-    result_part = (
-        f"{verdict_text}\n\n"
-        f"❓ *Previous question*\n{question}\n\n"
-        f"✅ *Answer*\n{answer}\n\n"
-        f"📈 New progress: {new_progress}"
-    )
+    # Блок по предыдущему слову: без заголовков, как ты хотела
+    prev_part = f"{question}\n\n{answer}"
     if example:
-        result_part += f"\n\n💬 *Example*\n_{example}_"
+        prev_part += f"\n\n{example}"
+    prev_part += f"\n\n📈 Progress {sign}1 = {new_progress}"
 
     # Готовим следующее слово
     next_row = await get_next_word()
     if not next_row:
-        # Больше слов нет
-        final_text = result_part + "\n\nNo more words in the database."
+        final_text = prev_part + "\n\nNo more words in the database."
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -168,15 +200,15 @@ async def handle_answer(callback: types.CallbackQuery):
 
     next_text, next_keyboard = build_question_message(next_row)
 
-    full_text = result_part + "\n\n---\n\n➡ *Next card:*\n\n" + next_text
+    full_text = prev_part + "\n\n---\n\n" + next_text
 
-    # Убираем клавиатуру с предыдущего сообщения
+    # Убираем клавиатуру со старого сообщения
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    # Отправляем новое сообщение с ответом + новым вопросом
+    # Отправляем новое сообщение: старое слово + новый вопрос
     await callback.message.answer(
         full_text,
         parse_mode=ParseMode.MARKDOWN,
@@ -190,7 +222,6 @@ async def handle_answer(callback: types.CallbackQuery):
 
 @app.on_event("startup")
 async def on_startup():
-    # Инициализация БД при старте сервиса
     await init_db()
     await add_dummy_words_if_empty()
     print("DB initialized")
@@ -205,7 +236,6 @@ async def root():
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
-    """Полностью заменяет содержимое таблицы words данными из Google Sheets."""
     words = [
         Word(
             sheet_row=w.sheet_row,
@@ -223,7 +253,6 @@ async def sync_words(payload: SyncWordsRequest):
 
 @app.get("/sync/progress")
 async def sync_progress():
-    """Возвращает список {sheet_row, progress} для экспорта в Google Sheets."""
     items = await get_all_progress()
     return {"status": "ok", "items": items}
 
@@ -232,7 +261,6 @@ async def sync_progress():
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    """Эндпоинт, который будет вызывать Telegram."""
     data = await request.json()
     update = types.Update.model_validate(data)
     await dp.feed_update(bot, update)
