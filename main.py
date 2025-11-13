@@ -205,9 +205,7 @@ async def root():
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
-    """
-    Полностью заменяет содержимое таблицы words данными из Google Sheets.
-    """
+    """Полностью заменяет содержимое таблицы words данными из Google Sheets."""
     words = [
         Word(
             sheet_row=w.sheet_row,
@@ -225,9 +223,7 @@ async def sync_words(payload: SyncWordsRequest):
 
 @app.get("/sync/progress")
 async def sync_progress():
-    """
-    Возвращает список {sheet_row, progress} для экспорта в Google Sheets.
-    """
+    """Возвращает список {sheet_row, progress} для экспорта в Google Sheets."""
     items = await get_all_progress()
     return {"status": "ok", "items": items}
 

@@ -17,6 +17,7 @@ class Word:
 
 
 async def init_db():
+    """Создаём таблицу, если её ещё нет."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -34,7 +35,7 @@ async def init_db():
 
 
 async def add_dummy_words_if_empty():
-    """На всякий случай – если база пустая, добавляем пару слов."""
+    """Если база пустая – добавляем пару тестовых слов (на случай, если забыли экспорт)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM words")
         (count,) = await cursor.fetchone()
@@ -42,7 +43,7 @@ async def add_dummy_words_if_empty():
 
         if count == 0:
             sample_words = [
-                (2, 0, "laufен — бегать/ходить", "laufen", "Ich laufe jeden Morgen im Park."),
+                (2, 0, "laufen — бегать/ходить", "laufen", "Ich laufe jeden Morgen im Park."),
                 (3, 0, "sprechen — говорить", "sprechen", "Wir sprechen Deutsch."),
             ]
             await db.executemany(
