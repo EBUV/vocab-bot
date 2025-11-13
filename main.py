@@ -1,6 +1,5 @@
 # main.py
 
-import asyncio
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -10,10 +9,12 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from config import BOT_TOKEN, WEBHOOK_PATH
 from db import init_db, add_dummy_words_if_empty, get_next_word, increment_progress
 
+# Проверяем токен
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
 
-# Создаём бота и диспетчер
+# --- Инициализация бота и FastAPI-приложения ---
+
 session = AiohttpSession()
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
@@ -21,7 +22,7 @@ dp = Dispatcher()
 app = FastAPI()
 
 
-# --- Handlers бота ---
+# --- Хендлеры бота ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -54,23 +55,26 @@ async def cmd_next(message: types.Message):
     if example:
         text += f"\n\n💬 Beispiel:\n_{example}_"
 
+    # пока считаем, что показ карточки = плюс к прогрессу
     await increment_progress(word_id)
 
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
-# --- FastAPI маршруты ---
+# --- Хуки FastAPI ---
 
 @app.on_event("startup")
 async def on_startup():
-    # Инициализируем БД
+    # Инициализация БД при старте сервиса
     await init_db()
     await add_dummy_words_if_empty()
     print("DB initialized")
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "vocab-bot is running"}
+
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
