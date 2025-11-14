@@ -1,5 +1,3 @@
-# main.py
-
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
@@ -13,20 +11,22 @@ from typing import List, Optional
 
 from db import (
     init_db,
-    add_dummy_words_if_empty,
     get_next_word,
-    increment_progress,
+    increment_progress_and_update_due,
     decrement_progress,
     replace_all_words,
     get_all_progress,
+    get_due_count,
     Word,
     get_word_by_id,
+    log_mistake,
+    get_last_mistakes,
+    get_users_with_mistakes,
 )
 
-# --- Проверка токена ---
-
+# Проверяем токен
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN.")
+    raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
 
 # --- Инициализация бота и FastAPI-приложения ---
 
@@ -55,9 +55,9 @@ class SyncWordsRequest(BaseModel):
     words: List[WordIn]
 
 
-# --- Вспомогательная функция: текст вопроса + клавиатура ---
+# --- Вспомогательные функции ---
 
-def build_question_message(row) -> tuple[str, InlineKeyboardMarkup]:
+def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
     """Текст вопроса и клавиатура для одного слова."""
     word_id = row["id"]
     progress = row["progress"]
@@ -65,7 +65,8 @@ def build_question_message(row) -> tuple[str, InlineKeyboardMarkup]:
 
     text = (
         f"❓ {question}\n\n"
-        f"📈 Current progress: {progress}"
+        f"📈 Current progress: {progress}\n"
+        f"📚 Words due now: {due_count}"
     )
 
     keyboard = InlineKeyboardMarkup(
@@ -90,6 +91,21 @@ def build_question_message(row) -> tuple[str, InlineKeyboardMarkup]:
     return text, keyboard
 
 
+async def send_mistakes_to_user(user_id: int, limit: int = 50):
+    """Отправить пользователю последние ошибки в виде отдельных сообщений."""
+    rows = await get_last_mistakes(user_id, limit=limit)
+    if not rows:
+        await bot.send_message(user_id, "No mistakes logged yet ✅")
+        return
+
+    # Отправляем по одному сообщению на слово: вопрос, пустая строка, ответ
+    for row in rows:
+        q = row["question"]
+        a = row["answer"]
+        text = f"{q}\n\n{a}"
+        await bot.send_message(user_id, text)
+
+
 # --- Хендлеры бота ---
 
 @dp.message(CommandStart())
@@ -102,7 +118,7 @@ async def cmd_start(message: types.Message):
         "• ✅ *I know* – if you remember the word\n"
         "• ❌ *I don't know* – if you don't\n"
         "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
-        "Words you know worse will appear more often."
+        "You can also use /mistakes to see your latest mistakes."
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -114,18 +130,25 @@ async def cmd_next(message: types.Message):
         await message.answer("There are no words in the database yet 🙈")
         return
 
-    text, keyboard = build_question_message(row)
+    due_count = await get_due_count()
+    text, keyboard = build_question_message(row, due_count)
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+
+@dp.message(Command("mistakes"))
+async def cmd_mistakes(message: types.Message):
+    """Ручная команда: прислать последние 50 ошибок."""
+    await send_mistakes_to_user(message.from_user.id, limit=50)
 
 
 @dp.callback_query(F.data.startswith("ans"))
 async def handle_answer(callback: types.CallbackQuery):
     """Обрабатываем: I know / I don't know / I was wrong."""
     data = callback.data
+    user_id = callback.from_user.id
 
     # --- Кнопка "I was wrong": корректируем предыдущее слово ---
     if data == "ans:fix":
-        user_id = callback.from_user.id
         last_id = user_last_word.get(user_id)
         if not last_id:
             await callback.answer("No previous word to fix.", show_alert=False)
@@ -138,6 +161,7 @@ async def handle_answer(callback: types.CallbackQuery):
 
         old_progress = row["progress"]
         await decrement_progress(last_id)
+        await log_mistake(user_id, last_id)
         new_progress = max(0, old_progress - 1)
 
         text = (
@@ -161,26 +185,26 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer("Word not found in the database.", show_alert=True)
         return
 
-    user_id = callback.from_user.id
     user_last_word[user_id] = word_id  # запоминаем это слово как последнее
 
     old_progress = row["progress"]
 
     if verdict == "know":
         delta = 1
-        await increment_progress(word_id)
+        new_progress = await increment_progress_and_update_due(word_id)
     else:  # "dont"
         delta = -1
         await decrement_progress(word_id)
+        await log_mistake(user_id, word_id)
+        new_progress = max(0, old_progress - 1)
 
-    new_progress = max(0, old_progress + delta)
     sign = "+" if delta > 0 else "-"
 
     question = row["question"]
     answer = row["answer"]
     example = row["example"]
 
-    # Блок по предыдущему слову: без заголовков, как ты хотела
+    # Блок по предыдущему слову
     prev_part = f"{question}\n\n{answer}"
     if example:
         prev_part += f"\n\n{example}"
@@ -198,7 +222,8 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    next_text, next_keyboard = build_question_message(next_row)
+    due_count = await get_due_count()
+    next_text, next_keyboard = build_question_message(next_row, due_count)
 
     full_text = prev_part + "\n\n---\n\n" + next_text
 
@@ -223,7 +248,6 @@ async def handle_answer(callback: types.CallbackQuery):
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    await add_dummy_words_if_empty()
     print("DB initialized")
 
 
@@ -265,3 +289,17 @@ async def telegram_webhook(request: Request):
     update = types.Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
+
+
+# --- Эндпоинт для ежедневного дайджеста ошибок ---
+
+@app.get("/cron/daily_mistakes")
+async def cron_daily_mistakes():
+    """
+    Эндпоинт, который можно дергать раз в день из внешнего планировщика.
+    Для каждого пользователя с ошибками отправляет последние 50.
+    """
+    user_ids = await get_users_with_mistakes()
+    for uid in user_ids:
+        await send_mistakes_to_user(uid, limit=50)
+    return {"status": "ok", "users_notified": len(user_ids)}
