@@ -5,10 +5,10 @@ import time
 
 from config import DB_PATH
 
-# Максимальный уровень "знания" слова
+# Max knowledge level
 MAX_LEVEL = 12
 
-# Интервалы повторения в минутах для каждого уровня
+# Spaced repetition intervals in minutes for each level
 INTERVAL_MINUTES = {
     0: 1,
     1: 1,
@@ -33,14 +33,14 @@ class Word:
     question: str
     answer: str
     example: Optional[str] = None
-    # секунды с 1970, могут быть None
+    # seconds since epoch, may be None
     last_success_ts: Optional[int] = None
 
 
 async def init_db():
-    """Создаём таблицы (если нет) и добавляем новые колонки при необходимости."""
+    """Create tables (if not exist) and add missing columns."""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Основная таблица слов
+        # Main words table
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS words (
@@ -55,7 +55,7 @@ async def init_db():
             )
             """
         )
-        # Таблица логов ошибок
+        # Mistakes log
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS mistakes (
@@ -68,11 +68,11 @@ async def init_db():
         )
         await db.commit()
 
-        # миграция для старых таблиц: добавляем колонки, если их нет
+        # Migration for old schemas
         cursor = await db.execute("PRAGMA table_info(words)")
         columns_info = await cursor.fetchall()
         await cursor.close()
-        existing_cols = {row[1] for row in columns_info}  # row[1] = name
+        existing_cols = {row[1] for row in columns_info}
 
         if "last_success_ts" not in existing_cols:
             await db.execute("ALTER TABLE words ADD COLUMN last_success_ts INTEGER")
@@ -82,7 +82,7 @@ async def init_db():
 
 
 def _get_interval_minutes(progress: int) -> int:
-    """Подбор интервала повторения по прогрессу."""
+    """Return SRS interval in minutes for a given progress level."""
     if progress >= MAX_LEVEL:
         progress = MAX_LEVEL
     if progress < 0:
@@ -92,18 +92,17 @@ def _get_interval_minutes(progress: int) -> int:
 
 async def replace_all_words(words: List[Word]):
     """
-    Полностью заменяет содержимое таблицы words списком из Google Sheets.
+    Replace all rows in `words` with data from Google Sheets.
 
-    last_success_ts передаётся в секундах (или None).
-    next_due_ts пересчитываем по прогрессу и last_success_ts.
+    last_success_ts is given in seconds (or None).
+    next_due_ts is recalculated from progress and last_success_ts.
     """
     async with aiosqlite.connect(DB_PATH) as db:
-        # Полностью пересобираем словарь; лог ошибок очищаем
+        # Fully rebuild dictionary; clear mistakes log as well
         await db.execute("DELETE FROM words")
         await db.execute("DELETE FROM mistakes")
 
         for w in words:
-            # вычисляем next_due_ts, если есть last_success_ts
             if w.last_success_ts is not None:
                 interval_minutes = _get_interval_minutes(w.progress)
                 next_due_ts = w.last_success_ts + interval_minutes * 60
@@ -133,14 +132,14 @@ async def replace_all_words(words: List[Word]):
 
 
 async def get_next_word(now_ts: Optional[int] = None):
-    """Возвращает следующее слово по логике SRS."""
+    """Return next word according to SRS logic."""
     if now_ts is None:
         now_ts = int(time.time())
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # 1. Должники (next_due_ts <= сейчас или ещё не задано)
+        # 1) Due words (or never scheduled)
         cursor = await db.execute(
             """
             SELECT id, sheet_row, progress, question, answer, example
@@ -158,7 +157,7 @@ async def get_next_word(now_ts: Optional[int] = None):
         if row is not None:
             return row
 
-        # 2. Ближайшие по времени
+        # 2) Next 100 closest words by due time
         cursor = await db.execute(
             """
             SELECT id, sheet_row, progress, question, answer, example
@@ -179,7 +178,7 @@ async def get_next_word(now_ts: Optional[int] = None):
 
 
 async def get_due_count(now_ts: Optional[int] = None) -> int:
-    """Сколько слов уже «созрело» к повторению на данный момент."""
+    """How many words are currently due for review."""
     if now_ts is None:
         now_ts = int(time.time())
 
@@ -199,9 +198,9 @@ async def get_due_count(now_ts: Optional[int] = None) -> int:
 
 
 async def increment_progress_and_update_due(word_id: int) -> int:
-    """Увеличивает прогресс слова и пересчитывает дату следующего повторения.
-
-    Возвращает новое значение progress.
+    """
+    Increase word's progress level and recalculate next_due_ts.
+    Returns the new progress value.
     """
     now_ts = int(time.time())
 
@@ -239,7 +238,7 @@ async def increment_progress_and_update_due(word_id: int) -> int:
 
 
 async def decrement_progress(word_id: int):
-    """Уменьшает прогресс на 1 (не ниже 0). Дату повторения не трогаем."""
+    """Decrease progress by 1 (not below 0). Do not touch due timestamps."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -264,7 +263,7 @@ async def decrement_progress(word_id: int):
 
 
 async def get_word_by_id(word_id: int):
-    """Возвращает одну строку words по id или None."""
+    """Return a single word row by id."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -281,7 +280,7 @@ async def get_word_by_id(word_id: int):
 
 
 async def get_all_progress():
-    """Для экспорта в Google Sheets: sheet_row + progress + last_success_ts."""
+    """For exporting back to Google Sheets: sheet_row + progress + last_success_ts."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -304,10 +303,53 @@ async def get_all_progress():
     ]
 
 
-# ---------- ЛОГ ОШИБОК ----------
+async def get_stats(user_id: int) -> dict:
+    """
+    Return basic statistics for /stats command:
+
+    - total_words: total count of words in deck
+    - due_now: currently due words
+    - well_known: words with progress >= 5
+    - mistakes_total: total mistakes logged for this user
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # total words
+        cursor = await db.execute("SELECT COUNT(*) FROM words")
+        (total_words,) = await cursor.fetchone()
+        await cursor.close()
+
+        # well-known words (progress >= 5, arbitrary threshold)
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM words WHERE progress >= ?",
+            (5,),
+        )
+        (well_known,) = await cursor.fetchone()
+        await cursor.close()
+
+        # total mistakes for this user
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM mistakes WHERE user_id = ?",
+            (user_id,),
+        )
+        (mistakes_total,) = await cursor.fetchone()
+        await cursor.close()
+
+    due_now = await get_due_count()
+
+    return {
+        "total_words": int(total_words),
+        "due_now": int(due_now),
+        "well_known": int(well_known),
+        "mistakes_total": int(mistakes_total),
+    }
+
+
+# ---------- MISTAKES LOG ----------
 
 async def log_mistake(user_id: int, word_id: int):
-    """Записать факт ошибки (don't know / was wrong) в лог."""
+    """Insert mistake record (I don't know / I was wrong)."""
     now_ts = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -321,7 +363,7 @@ async def log_mistake(user_id: int, word_id: int):
 
 
 async def get_last_mistakes(user_id: int, limit: int = 50):
-    """Последние ошибки пользователя (вопрос + ответ)."""
+    """Fetch last mistakes for the given user (question + answer)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -341,7 +383,7 @@ async def get_last_mistakes(user_id: int, limit: int = 50):
 
 
 async def get_users_with_mistakes():
-    """Список user_id, у которых есть ошибки (для дневного дайджеста)."""
+    """Return list of user_ids that have at least one logged mistake."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT DISTINCT user_id FROM mistakes"

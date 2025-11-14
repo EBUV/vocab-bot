@@ -22,11 +22,11 @@ from db import (
     log_mistake,
     get_last_mistakes,
     get_users_with_mistakes,
+    get_stats,
 )
 
 # ----- ACCESS CONTROL -----
 
-# Only these Telegram user IDs are allowed to use the bot
 ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
 
 
@@ -135,7 +135,9 @@ async def cmd_start(message: types.Message):
         "• ✅ *I know* – if you remember the word\n"
         "• ❌ *I don't know* – if you don't\n"
         "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
-        "You can also use /mistakes to see your latest mistakes."
+        "You can also use:\n"
+        "• /mistakes – to see your latest mistakes\n"
+        "• /stats – to see your current statistics."
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -163,6 +165,27 @@ async def cmd_mistakes(message: types.Message):
         return
 
     await send_mistakes_to_user(message.from_user.id, limit=50)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Show basic learning statistics."""
+    user_id = message.from_user.id
+    if not is_allowed(user_id):
+        await message.answer("Sorry, this bot is currently in private beta.")
+        return
+
+    s = await get_stats(user_id)
+
+    text = (
+        "📊 *Your stats*\n\n"
+        f"• Total words in deck: *{s['total_words']}*\n"
+        f"• Words due now: *{s['due_now']}*\n"
+        f"• Well-known words (progress ≥ 5): *{s['well_known']}*\n"
+        f"• Total mistakes logged: *{s['mistakes_total']}*"
+    )
+
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.callback_query(F.data.startswith("ans"))
@@ -358,7 +381,6 @@ async def cron_daily_mistakes():
     For each user who has mistakes logged, send them last N mistakes.
     """
     user_ids = await get_users_with_mistakes()
-    # Note: with access control, only allowed users will effectively receive messages.
     for uid in user_ids:
         if is_allowed(uid):
             await send_mistakes_to_user(uid, limit=50)
