@@ -1,14 +1,16 @@
+# main.py
+
+from typing import List, Optional, Dict
+
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pydantic import BaseModel
 
 from config import BOT_TOKEN, WEBHOOK_PATH
-from pydantic import BaseModel
-from typing import List, Optional
-
 from db import (
     init_db,
     get_next_word,
@@ -23,18 +25,19 @@ from db import (
     get_last_mistakes,
     get_users_with_mistakes,
     get_stats,
+    get_mistakes_for_sheet,
 )
 
-# ----- ACCESS CONTROL -----
+# ---------- Access control ----------
 
-ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
+ALLOWED_USER_IDS = {518129411}  # your Telegram user id
 
 
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-# ----- BOT & APP SETUP -----
+# ---------- Bot & FastAPI setup ----------
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
@@ -45,11 +48,11 @@ dp = Dispatcher()
 
 app = FastAPI()
 
-# Store last answered word per user (for "I was wrong")
-user_last_word: dict[int, int] = {}
+# last answered word per user (for "I was wrong")
+user_last_word: Dict[int, int] = {}
 
 
-# ----- Pydantic models for sync endpoints -----
+# ---------- Pydantic models for sync ----------
 
 class WordIn(BaseModel):
     sheet_row: int
@@ -57,18 +60,22 @@ class WordIn(BaseModel):
     question: str
     answer: str
     example: Optional[str] = None
-    # milliseconds (Date.now()), may be omitted
+    # Date.now() value in ms, may be omitted
     last_success_ts_ms: Optional[int] = None
+    # mistakes counter from column I
+    mistake_count: int = 0
 
 
 class SyncWordsRequest(BaseModel):
     words: List[WordIn]
 
 
-# ----- Helper functions -----
+# ---------- Helper functions ----------
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Build the question text and inline keyboard for a single word."""
+    """
+    Build the question text + inline keyboard for one word.
+    """
     word_id = row["id"]
     progress = row["progress"]
     question = row["question"]
@@ -101,28 +108,28 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
     return text, keyboard
 
 
-async def send_mistakes_to_user(user_id: int, limit: int = 50):
-    """Send last mistakes to a user as separate messages."""
+async def send_mistakes_to_user(user_id: int, limit: int = 50) -> None:
+    """
+    Send last N mistakes to the user as separate messages.
+    """
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
-    # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
-    # Each word in a separate message: question, 2 blank lines, answer
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
+        text = f"{q}\n\n\n{a}"  # question + 2 blank lines + answer
         await bot.send_message(user_id, text)
 
 
-# ----- Bot handlers -----
+# ---------- Bot handlers ----------
 
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message) -> None:
     if not is_allowed(message.from_user.id):
         await message.answer("Sorry, this bot is currently in private beta.")
         return
@@ -143,7 +150,7 @@ async def cmd_start(message: types.Message):
 
 
 @dp.message(Command("next"))
-async def cmd_next(message: types.Message):
+async def cmd_next(message: types.Message) -> None:
     if not is_allowed(message.from_user.id):
         await message.answer("Sorry, this bot is currently in private beta.")
         return
@@ -159,7 +166,7 @@ async def cmd_next(message: types.Message):
 
 
 @dp.message(Command("mistakes"))
-async def cmd_mistakes(message: types.Message):
+async def cmd_mistakes(message: types.Message) -> None:
     if not is_allowed(message.from_user.id):
         await message.answer("Sorry, this bot is currently in private beta.")
         return
@@ -168,8 +175,10 @@ async def cmd_mistakes(message: types.Message):
 
 
 @dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    """Show basic learning statistics."""
+async def cmd_stats(message: types.Message) -> None:
+    """
+    Show basic learning statistics.
+    """
     user_id = message.from_user.id
     if not is_allowed(user_id):
         await message.answer("Sorry, this bot is currently in private beta.")
@@ -189,7 +198,7 @@ async def cmd_stats(message: types.Message):
 
 
 @dp.callback_query(F.data.startswith("ans"))
-async def handle_answer(callback: types.CallbackQuery):
+async def handle_answer(callback: types.CallbackQuery) -> None:
     user_id = callback.from_user.id
 
     if not is_allowed(user_id):
@@ -210,10 +219,8 @@ async def handle_answer(callback: types.CallbackQuery):
             await callback.answer("Previous word not found.", show_alert=False)
             return
 
-        old_progress = row["progress"]
-        await decrement_progress(last_id)
+        new_progress = await decrement_progress(last_id)
         await log_mistake(user_id, last_id)
-        new_progress = max(0, old_progress - 1)
 
         text = (
             "🔁 Previous word corrected.\n"
@@ -223,7 +230,7 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # ----- I know / I don't know -----
+    # ----- "I know" / "I don't know" -----
     try:
         _, word_id_str, verdict = data.split(":")
         word_id = int(word_id_str)
@@ -241,13 +248,12 @@ async def handle_answer(callback: types.CallbackQuery):
     old_progress = row["progress"]
 
     if verdict == "know":
-        delta = 1
+        delta = +1
         new_progress = await increment_progress_and_update_due(word_id)
     else:  # "dont"
         delta = -1
-        await decrement_progress(word_id)
+        new_progress = await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
-        new_progress = max(0, old_progress - 1)
 
     sign = "+" if delta > 0 else "-"
 
@@ -290,10 +296,10 @@ async def handle_answer(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ----- FastAPI lifecycle -----
+# ---------- FastAPI lifecycle ----------
 
 @app.on_event("startup")
-async def on_startup():
+async def on_startup() -> None:
     await init_db()
     print("DB initialized")
 
@@ -303,15 +309,15 @@ async def root():
     return {"status": "ok", "message": "vocab-bot is running"}
 
 
-# ----- Sync endpoints for Google Sheets -----
+# ---------- Sync endpoints for Google Sheets ----------
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
     """
-    Import from Google Sheets.
+    Import words from Google Sheets.
 
     last_success_ts_ms is given in milliseconds (Date.now()).
-    Inside we store last_success_ts in seconds and compute next_due_ts.
+    We store last_success_ts in seconds and compute next_due_ts.
     """
     words: List[Word] = []
     for w in payload.words:
@@ -328,6 +334,7 @@ async def sync_words(payload: SyncWordsRequest):
                 answer=w.answer,
                 example=w.example,
                 last_success_ts=last_success_sec,
+                mistake_count=w.mistake_count or 0,
             )
         )
 
@@ -338,7 +345,7 @@ async def sync_words(payload: SyncWordsRequest):
 @app.get("/sync/progress")
 async def sync_progress():
     """
-    Export to Google Sheets.
+    Export per-word progress to Google Sheets.
 
     last_success_ts is returned in milliseconds so it can be written back
     to the sheet as a raw Date.now()-style value.
@@ -351,18 +358,39 @@ async def sync_progress():
             ts_ms = int(ts * 1000)
         else:
             ts_ms = None
+
         out.append(
             {
                 "sheet_row": item["sheet_row"],
                 "progress": item["progress"],
                 "last_success_ts_ms": ts_ms,
+                "mistake_count": item.get("mistake_count", 0),
             }
         )
 
     return {"status": "ok", "items": out}
 
 
-# ----- Telegram webhook -----
+@app.get("/sync/mistakes")
+async def sync_mistakes_for_sheet():
+    """
+    Export full mistakes log for Google Sheets (Log2).
+    """
+    rows = await get_mistakes_for_sheet()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "sheet_row": r["sheet_row"],
+                "question": r["question"],
+                "answer": r["answer"],
+                "created_at_ms": int(r["created_at"] * 1000),
+            }
+        )
+    return {"status": "ok", "items": out}
+
+
+# ---------- Telegram webhook ----------
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -372,7 +400,7 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-# ----- Daily mistakes cron endpoint -----
+# ---------- Daily mistakes cron endpoint ----------
 
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
