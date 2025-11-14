@@ -24,7 +24,18 @@ from db import (
     get_users_with_mistakes,
 )
 
-# Проверяем токен
+# ----- ACCESS CONTROL -----
+
+# Only these Telegram user IDs are allowed to use the bot
+ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
+
+
+def is_allowed(user_id: int) -> bool:
+    return user_id in ALLOWED_USER_IDS
+
+
+# ----- BOT & APP SETUP -----
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
 
@@ -34,11 +45,11 @@ dp = Dispatcher()
 
 app = FastAPI()
 
-# Последнее слово пользователя (для "I was wrong")
+# Store last answered word per user (for "I was wrong")
 user_last_word: dict[int, int] = {}
 
 
-# ----- Pydantic модели -----
+# ----- Pydantic models for sync endpoints -----
 
 class WordIn(BaseModel):
     sheet_row: int
@@ -46,7 +57,7 @@ class WordIn(BaseModel):
     question: str
     answer: str
     example: Optional[str] = None
-    # миллисекунды (Date.now()), можем не передавать
+    # milliseconds (Date.now()), may be omitted
     last_success_ts_ms: Optional[int] = None
 
 
@@ -54,9 +65,10 @@ class SyncWordsRequest(BaseModel):
     words: List[WordIn]
 
 
-# ----- Вспомогательные функции -----
+# ----- Helper functions -----
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the question text and inline keyboard for a single word."""
     word_id = row["id"]
     progress = row["progress"]
     question = row["question"]
@@ -90,27 +102,31 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 50):
-    """Отправить пользователю последние ошибки."""
+    """Send last mistakes to a user as separate messages."""
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
-    # Заголовок
+    # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
-    # Каждое слово отдельным сообщением: вопрос, 2 пустых строки, ответ
+    # Each word in a separate message: question, 2 blank lines, answer
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"  # две пустые строки между
+        text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
         await bot.send_message(user_id, text)
 
 
-# ----- Хендлеры бота -----
+# ----- Bot handlers -----
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        await message.answer("Sorry, this bot is currently in private beta.")
+        return
+
     text = (
         "Hi! 👋\n\n"
         "I'm a bot for training German vocabulary.\n"
@@ -126,6 +142,10 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("next"))
 async def cmd_next(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        await message.answer("Sorry, this bot is currently in private beta.")
+        return
+
     row = await get_next_word()
     if not row:
         await message.answer("There are no words in the database yet 🙈")
@@ -138,13 +158,22 @@ async def cmd_next(message: types.Message):
 
 @dp.message(Command("mistakes"))
 async def cmd_mistakes(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        await message.answer("Sorry, this bot is currently in private beta.")
+        return
+
     await send_mistakes_to_user(message.from_user.id, limit=50)
 
 
 @dp.callback_query(F.data.startswith("ans"))
 async def handle_answer(callback: types.CallbackQuery):
-    data = callback.data
     user_id = callback.from_user.id
+
+    if not is_allowed(user_id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+
+    data = callback.data
 
     # ----- "I was wrong" -----
     if data == "ans:fix":
@@ -191,7 +220,7 @@ async def handle_answer(callback: types.CallbackQuery):
     if verdict == "know":
         delta = 1
         new_progress = await increment_progress_and_update_due(word_id)
-    else:  # dont know
+    else:  # "dont"
         delta = -1
         await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
@@ -238,7 +267,7 @@ async def handle_answer(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ----- FastAPI hooks -----
+# ----- FastAPI lifecycle -----
 
 @app.on_event("startup")
 async def on_startup():
@@ -251,15 +280,15 @@ async def root():
     return {"status": "ok", "message": "vocab-bot is running"}
 
 
-# ----- Синхронизация с Google Sheets -----
+# ----- Sync endpoints for Google Sheets -----
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
     """
-    Импорт из Google Sheets.
+    Import from Google Sheets.
 
-    last_success_ts_ms — в миллисекундах (Date.now()),
-    внутри переводим в секунды.
+    last_success_ts_ms is given in milliseconds (Date.now()).
+    Inside we store last_success_ts in seconds and compute next_due_ts.
     """
     words: List[Word] = []
     for w in payload.words:
@@ -286,10 +315,10 @@ async def sync_words(payload: SyncWordsRequest):
 @app.get("/sync/progress")
 async def sync_progress():
     """
-    Экспорт в Google Sheets.
+    Export to Google Sheets.
 
-    last_success_ts возвращаем в миллисекундах
-    (чтобы можно было прямо писать Date.now() в ячейку).
+    last_success_ts is returned in milliseconds so it can be written back
+    to the sheet as a raw Date.now()-style value.
     """
     items = await get_all_progress()
     out = []
@@ -310,7 +339,7 @@ async def sync_progress():
     return {"status": "ok", "items": out}
 
 
-# ----- Webhook для Telegram -----
+# ----- Telegram webhook -----
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -320,11 +349,17 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-# ----- Эндпоинт для ежедневного дайджеста ошибок -----
+# ----- Daily mistakes cron endpoint -----
 
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
+    """
+    Endpoint to be called by an external scheduler (cron).
+    For each user who has mistakes logged, send them last N mistakes.
+    """
     user_ids = await get_users_with_mistakes()
+    # Note: with access control, only allowed users will effectively receive messages.
     for uid in user_ids:
-        await send_mistakes_to_user(uid, limit=50)
+        if is_allowed(uid):
+            await send_mistakes_to_user(uid, limit=50)
     return {"status": "ok", "users_notified": len(user_ids)}
