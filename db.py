@@ -33,6 +33,8 @@ class Word:
     question: str
     answer: str
     example: Optional[str] = None
+    # секунды с 1970, могут быть None
+    last_success_ts: Optional[int] = None
 
 
 async def init_db():
@@ -92,41 +94,53 @@ async def replace_all_words(words: List[Word]):
     """
     Полностью заменяет содержимое таблицы words списком из Google Sheets.
 
-    Пока last_success_ts и next_due_ts ставим NULL.
-    Позднее можно будет импортировать время последнего успеха из таблицы.
+    last_success_ts передаётся в секундах (или None).
+    next_due_ts пересчитываем по прогрессу и last_success_ts.
     """
     async with aiosqlite.connect(DB_PATH) as db:
+        # Полностью пересобираем словарь; лог ошибок очищаем
         await db.execute("DELETE FROM words")
         await db.execute("DELETE FROM mistakes")
-        await db.executemany(
-            """
-            INSERT INTO words (
-                sheet_row, progress, question, answer, example, last_success_ts, next_due_ts
+
+        for w in words:
+            # вычисляем next_due_ts, если есть last_success_ts
+            if w.last_success_ts is not None:
+                interval_minutes = _get_interval_minutes(w.progress)
+                next_due_ts = w.last_success_ts + interval_minutes * 60
+            else:
+                next_due_ts = None
+
+            await db.execute(
+                """
+                INSERT INTO words (
+                    sheet_row, progress, question, answer, example,
+                    last_success_ts, next_due_ts
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    w.sheet_row,
+                    w.progress,
+                    w.question,
+                    w.answer,
+                    w.example,
+                    w.last_success_ts,
+                    next_due_ts,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, NULL, NULL)
-            """,
-            [
-                (w.sheet_row, w.progress, w.question, w.answer, w.example)
-                for w in words
-            ],
-        )
+
         await db.commit()
 
 
 async def get_next_word(now_ts: Optional[int] = None):
-    """Возвращает следующее слово по логике SRS.
-
-    1) Сначала берём слова, у которых срок повторения наступил
-       (next_due_ts <= now или next_due_ts IS NULL — ещё не повторялось).
-    2) Если таких нет — берём до 100 ближайших по next_due_ts и выбираем одно случайно.
-    """
+    """Возвращает следующее слово по логике SRS."""
     if now_ts is None:
         now_ts = int(time.time())
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # 1. Должники
+        # 1. Должники (next_due_ts <= сейчас или ещё не задано)
         cursor = await db.execute(
             """
             SELECT id, sheet_row, progress, question, answer, example
@@ -267,17 +281,25 @@ async def get_word_by_id(word_id: int):
 
 
 async def get_all_progress():
-    """Для экспорта в Google Sheets: sheet_row + progress для всех слов."""
+    """Для экспорта в Google Sheets: sheet_row + progress + last_success_ts."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT sheet_row, progress FROM words ORDER BY sheet_row ASC"
+            """
+            SELECT sheet_row, progress, last_success_ts
+            FROM words
+            ORDER BY sheet_row ASC
+            """
         )
         rows = await cursor.fetchall()
         await cursor.close()
 
     return [
-        {"sheet_row": row["sheet_row"], "progress": row["progress"]}
+        {
+            "sheet_row": row["sheet_row"],
+            "progress": row["progress"],
+            "last_success_ts": row["last_success_ts"],
+        }
         for row in rows
     ]
 

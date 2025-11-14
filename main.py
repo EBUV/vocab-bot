@@ -28,20 +28,17 @@ from db import (
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
 
-# --- Инициализация бота и FastAPI-приложения ---
-
 session = AiohttpSession()
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
 app = FastAPI()
 
-# --- Память: последнее слово, по которому был ответ (для кнопки "I was wrong") ---
-
+# Последнее слово пользователя (для "I was wrong")
 user_last_word: dict[int, int] = {}
 
 
-# --- Pydantic-модели для sync-эндпоинтов ---
+# ----- Pydantic модели -----
 
 class WordIn(BaseModel):
     sheet_row: int
@@ -49,16 +46,17 @@ class WordIn(BaseModel):
     question: str
     answer: str
     example: Optional[str] = None
+    # миллисекунды (Date.now()), можем не передавать
+    last_success_ts_ms: Optional[int] = None
 
 
 class SyncWordsRequest(BaseModel):
     words: List[WordIn]
 
 
-# --- Вспомогательные функции ---
+# ----- Вспомогательные функции -----
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Текст вопроса и клавиатура для одного слова."""
     word_id = row["id"]
     progress = row["progress"]
     question = row["question"]
@@ -92,21 +90,24 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 50):
-    """Отправить пользователю последние ошибки в виде отдельных сообщений."""
+    """Отправить пользователю последние ошибки."""
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
-    # Отправляем по одному сообщению на слово: вопрос, пустая строка, ответ
+    # Заголовок
+    await bot.send_message(user_id, "Words you should review:\n")
+
+    # Каждое слово отдельным сообщением: вопрос, 2 пустых строки, ответ
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n{a}"
+        text = f"{q}\n\n\n{a}"  # две пустые строки между
         await bot.send_message(user_id, text)
 
 
-# --- Хендлеры бота ---
+# ----- Хендлеры бота -----
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -137,17 +138,15 @@ async def cmd_next(message: types.Message):
 
 @dp.message(Command("mistakes"))
 async def cmd_mistakes(message: types.Message):
-    """Ручная команда: прислать последние 50 ошибок."""
     await send_mistakes_to_user(message.from_user.id, limit=50)
 
 
 @dp.callback_query(F.data.startswith("ans"))
 async def handle_answer(callback: types.CallbackQuery):
-    """Обрабатываем: I know / I don't know / I was wrong."""
     data = callback.data
     user_id = callback.from_user.id
 
-    # --- Кнопка "I was wrong": корректируем предыдущее слово ---
+    # ----- "I was wrong" -----
     if data == "ans:fix":
         last_id = user_last_word.get(user_id)
         if not last_id:
@@ -172,7 +171,7 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # --- Кнопки I know / I don't know ---
+    # ----- I know / I don't know -----
     try:
         _, word_id_str, verdict = data.split(":")
         word_id = int(word_id_str)
@@ -185,14 +184,14 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer("Word not found in the database.", show_alert=True)
         return
 
-    user_last_word[user_id] = word_id  # запоминаем это слово как последнее
+    user_last_word[user_id] = word_id
 
     old_progress = row["progress"]
 
     if verdict == "know":
         delta = 1
         new_progress = await increment_progress_and_update_due(word_id)
-    else:  # "dont"
+    else:  # dont know
         delta = -1
         await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
@@ -204,13 +203,11 @@ async def handle_answer(callback: types.CallbackQuery):
     answer = row["answer"]
     example = row["example"]
 
-    # Блок по предыдущему слову
     prev_part = f"{question}\n\n{answer}"
     if example:
         prev_part += f"\n\n{example}"
     prev_part += f"\n\n📈 Progress {sign}1 = {new_progress}"
 
-    # Готовим следующее слово
     next_row = await get_next_word()
     if not next_row:
         final_text = prev_part + "\n\nNo more words in the database."
@@ -227,13 +224,11 @@ async def handle_answer(callback: types.CallbackQuery):
 
     full_text = prev_part + "\n\n---\n\n" + next_text
 
-    # Убираем клавиатуру со старого сообщения
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    # Отправляем новое сообщение: старое слово + новый вопрос
     await callback.message.answer(
         full_text,
         parse_mode=ParseMode.MARKDOWN,
@@ -243,7 +238,7 @@ async def handle_answer(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# --- Хуки FastAPI ---
+# ----- FastAPI hooks -----
 
 @app.on_event("startup")
 async def on_startup():
@@ -256,20 +251,33 @@ async def root():
     return {"status": "ok", "message": "vocab-bot is running"}
 
 
-# --- Эндпоинты для синхронизации с Google Sheets ---
+# ----- Синхронизация с Google Sheets -----
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
-    words = [
-        Word(
-            sheet_row=w.sheet_row,
-            progress=w.progress,
-            question=w.question,
-            answer=w.answer,
-            example=w.example,
+    """
+    Импорт из Google Sheets.
+
+    last_success_ts_ms — в миллисекундах (Date.now()),
+    внутри переводим в секунды.
+    """
+    words: List[Word] = []
+    for w in payload.words:
+        if w.last_success_ts_ms is not None:
+            last_success_sec = int(w.last_success_ts_ms // 1000)
+        else:
+            last_success_sec = None
+
+        words.append(
+            Word(
+                sheet_row=w.sheet_row,
+                progress=w.progress,
+                question=w.question,
+                answer=w.answer,
+                example=w.example,
+                last_success_ts=last_success_sec,
+            )
         )
-        for w in payload.words
-    ]
 
     await replace_all_words(words)
     return {"status": "ok", "count": len(words)}
@@ -277,11 +285,32 @@ async def sync_words(payload: SyncWordsRequest):
 
 @app.get("/sync/progress")
 async def sync_progress():
+    """
+    Экспорт в Google Sheets.
+
+    last_success_ts возвращаем в миллисекундах
+    (чтобы можно было прямо писать Date.now() в ячейку).
+    """
     items = await get_all_progress()
-    return {"status": "ok", "items": items}
+    out = []
+    for item in items:
+        ts = item["last_success_ts"]
+        if ts is not None:
+            ts_ms = int(ts * 1000)
+        else:
+            ts_ms = None
+        out.append(
+            {
+                "sheet_row": item["sheet_row"],
+                "progress": item["progress"],
+                "last_success_ts_ms": ts_ms,
+            }
+        )
+
+    return {"status": "ok", "items": out}
 
 
-# --- Webhook для Telegram ---
+# ----- Webhook для Telegram -----
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -291,14 +320,10 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-# --- Эндпоинт для ежедневного дайджеста ошибок ---
+# ----- Эндпоинт для ежедневного дайджеста ошибок -----
 
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
-    """
-    Эндпоинт, который можно дергать раз в день из внешнего планировщика.
-    Для каждого пользователя с ошибками отправляет последние 50.
-    """
     user_ids = await get_users_with_mistakes()
     for uid in user_ids:
         await send_mistakes_to_user(uid, limit=50)
