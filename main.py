@@ -17,9 +17,7 @@ from db import (
     increment_progress_and_update_due,
     decrement_progress,
     replace_all_words,
-    replace_all_mistakes,
     get_all_progress,
-    get_all_mistakes_for_sync,
     get_due_count,
     Word,
     get_word_by_id,
@@ -36,6 +34,29 @@ ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
 
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
+
+
+# ----- TEXT SANITIZING (защита от “плохих” символов для Telegram) -----
+
+CODES_TO_REMOVE = set([
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+    23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35, 38, 43, 60, 62, 92, 94, 96, 123, 124,
+    125, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141,
+    142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157,
+    158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173,
+    174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189,
+    190, 191, 192, 193, 194, 195, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206,
+    207, 208, 209, 210, 211, 212, 213, 215, 216, 217, 218, 219, 221, 222, 224, 225,
+    226, 227, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242,
+    243, 244, 245, 247, 248, 249, 250, 251, 253, 254, 255
+])
+
+
+def sanitize_text(text: str) -> str:
+    """Remove all disallowed characters by unicode code."""
+    if not text:
+        return text
+    return "".join(ch for ch in text if ord(ch) not in CODES_TO_REMOVE)
 
 
 # ----- BOT & APP SETUP -----
@@ -55,7 +76,6 @@ user_last_word: dict[int, int] = {}
 
 # ----- Pydantic models for sync endpoints -----
 
-
 class WordIn(BaseModel):
     sheet_row: int
     progress: int
@@ -64,23 +84,13 @@ class WordIn(BaseModel):
     example: Optional[str] = None
     # milliseconds (Date.now()), may be omitted
     last_success_ts_ms: Optional[int] = None
-    # total mistakes count for this word (column I)
-    mistakes_count: Optional[int] = 0
-
-
-class MistakeLogIn(BaseModel):
-    user_id: int
-    sheet_row: int
-    ts_ms: int  # timestamp in milliseconds (Date.now)
 
 
 class SyncWordsRequest(BaseModel):
     words: List[WordIn]
-    mistakes_log: Optional[List[MistakeLogIn]] = None
 
 
 # ----- Helper functions -----
-
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
     """Build the question text and inline keyboard for a single word."""
@@ -93,6 +103,8 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
         f"📈 Current progress: {progress}\n"
         f"📚 Words due now: {due_count}"
     )
+
+    text = sanitize_text(text)
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -131,11 +143,11 @@ async def send_mistakes_to_user(user_id: int, limit: int = 50):
         q = row["question"]
         a = row["answer"]
         text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
+        text = sanitize_text(text)
         await bot.send_message(user_id, text)
 
 
 # ----- Bot handlers -----
-
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -146,7 +158,7 @@ async def cmd_start(message: types.Message):
     text = (
         "Hi! 👋\n\n"
         "I'm a bot for training German vocabulary.\n"
-        "Use /next to get the first card.\n\n"
+        "Send /next to get the first card.\n\n"
         "For each card choose:\n"
         "• ✅ *I know* – if you remember the word\n"
         "• ❌ *I don't know* – if you don't\n"
@@ -155,7 +167,7 @@ async def cmd_start(message: types.Message):
         "• /mistakes – to see your latest mistakes\n"
         "• /stats – to see your current statistics."
     )
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.message(Command("next"))
@@ -201,7 +213,7 @@ async def cmd_stats(message: types.Message):
         f"• Total mistakes logged: *{s['mistakes_total']}*"
     )
 
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.callback_query(F.data.startswith("ans"))
@@ -235,7 +247,7 @@ async def handle_answer(callback: types.CallbackQuery):
             "🔁 Previous word corrected.\n"
             f"📉 Progress -1 = {new_progress}"
         )
-        await callback.message.answer(text)
+        await callback.message.answer(sanitize_text(text))
         await callback.answer()
         return
 
@@ -276,9 +288,12 @@ async def handle_answer(callback: types.CallbackQuery):
         prev_part += f"\n\n{example}"
     prev_part += f"\n\n📈 Progress {sign}1 = {new_progress}"
 
+    prev_part = sanitize_text(prev_part)
+
     next_row = await get_next_word()
     if not next_row:
         final_text = prev_part + "\n\nNo more words in the database."
+        final_text = sanitize_text(final_text)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -291,6 +306,7 @@ async def handle_answer(callback: types.CallbackQuery):
     next_text, next_keyboard = build_question_message(next_row, due_count)
 
     full_text = prev_part + "\n\n---\n\n" + next_text
+    full_text = sanitize_text(full_text)
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -308,7 +324,6 @@ async def handle_answer(callback: types.CallbackQuery):
 
 # ----- FastAPI lifecycle -----
 
-
 @app.on_event("startup")
 async def on_startup():
     await init_db()
@@ -322,7 +337,6 @@ async def root():
 
 # ----- Sync endpoints for Google Sheets -----
 
-
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
     """
@@ -330,7 +344,6 @@ async def sync_words(payload: SyncWordsRequest):
 
     last_success_ts_ms is given in milliseconds (Date.now()).
     Inside we store last_success_ts in seconds and compute next_due_ts.
-    mistakes_log: full mistakes history from Log2.
     """
     words: List[Word] = []
     for w in payload.words:
@@ -347,22 +360,11 @@ async def sync_words(payload: SyncWordsRequest):
                 answer=w.answer,
                 example=w.example,
                 last_success_ts=last_success_sec,
-                mistakes_count=w.mistakes_count or 0,
             )
         )
 
-    # rebuild words
     await replace_all_words(words)
-
-    # rebuild mistakes log (if provided)
-    entries: list[tuple[int, int, int]] = []
-    if payload.mistakes_log:
-        for m in payload.mistakes_log:
-            ts_sec = int(m.ts_ms // 1000)
-            entries.append((m.user_id, m.sheet_row, ts_sec))
-
-    await replace_all_mistakes(entries)
-    return {"status": "ok", "count": len(words), "mistakes": len(entries)}
+    return {"status": "ok", "count": len(words)}
 
 
 @app.get("/sync/progress")
@@ -370,44 +372,29 @@ async def sync_progress():
     """
     Export to Google Sheets.
 
-    - items: per-word progress + last_success_ts_ms + mistakes_count
-    - mistakes_log: full mistakes history (Log2 sheet)
+    last_success_ts is returned in milliseconds so it can be written back
+    to the sheet as a raw Date.now()-style value.
     """
-    word_items_raw = await get_all_progress()
-    items = []
-    for item in word_items_raw:
+    items = await get_all_progress()
+    out = []
+    for item in items:
         ts = item["last_success_ts"]
         if ts is not None:
             ts_ms = int(ts * 1000)
         else:
             ts_ms = None
-        items.append(
+        out.append(
             {
                 "sheet_row": item["sheet_row"],
                 "progress": item["progress"],
                 "last_success_ts_ms": ts_ms,
-                "mistakes_count": item["mistakes_count"],
             }
         )
 
-    mistakes_raw = await get_all_mistakes_for_sync()
-    mistakes_out = []
-    for row in mistakes_raw:
-        mistakes_out.append(
-            {
-                "user_id": row["user_id"],
-                "sheet_row": row["sheet_row"],
-                "ts_ms": int(row["ts"] * 1000),
-                "question": row["question"],
-                "answer": row["answer"],
-            }
-        )
-
-    return {"status": "ok", "items": items, "mistakes_log": mistakes_out}
+    return {"status": "ok", "items": out}
 
 
 # ----- Telegram webhook -----
-
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -418,7 +405,6 @@ async def telegram_webhook(request: Request):
 
 
 # ----- Daily mistakes cron endpoint -----
-
 
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
