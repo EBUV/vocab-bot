@@ -40,25 +40,27 @@ def is_allowed(user_id: int) -> bool:
 
 # ----- TEXT SANITIZING (remove problematic chars for Telegram) -----
 
-CODES_TO_REMOVE = set([
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-    23, 24, 25, 26, 27, 28, 29, 30, 31, 34, 35, 38, 43, 60, 62, 92, 94, 96, 123, 124,
-    125, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141,
-    142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157,
-    158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173,
-    174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189,
-    190, 191, 192, 193, 194, 195, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206,
-    207, 208, 209, 210, 211, 212, 213, 215, 216, 217, 218, 219, 221, 222, 224, 225,
-    226, 227, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242,
-    243, 244, 245, 247, 248, 249, 250, 251, 253, 254, 255
-])
+# удаляем только "странные" управляющие символы, но оставляем \t, \n, \r
+CODES_TO_REMOVE = set(
+    c for c in range(0, 32) if c not in (9, 10, 13)
+)
+CODES_TO_REMOVE.add(127)  # DEL
+
+# иногда проблемы создают спец. разделители строк из Юникода
+UNICODE_BAD_CODES = {0x2028, 0x2029}
 
 
 def sanitize_text(text: str) -> str:
-    """Remove characters whose Unicode code is in CODES_TO_REMOVE."""
+    """Remove characters that Telegram may not like (control chars etc.)."""
     if not text:
         return text
-    return "".join(ch for ch in text if ord(ch) not in CODES_TO_REMOVE)
+    result_chars = []
+    for ch in text:
+        code = ord(ch)
+        if code in CODES_TO_REMOVE or code in UNICODE_BAD_CODES:
+            continue
+        result_chars.append(ch)
+    return "".join(result_chars)
 
 
 # ----- BOT & APP SETUP -----
