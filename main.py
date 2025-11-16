@@ -1,8 +1,10 @@
 # main.py
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -29,7 +31,9 @@ from db import (
     get_stats,
 )
 
-# ----- ACCESS CONTROL -----
+# ---------------------------------------------------------------------------
+# ACCESS CONTROL
+# ---------------------------------------------------------------------------
 
 ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
 
@@ -38,12 +42,12 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-# ----- TEXT SANITIZING (remove problematic chars for Telegram) -----
+# ---------------------------------------------------------------------------
+# TEXT SANITIZING (remove problematic chars for Telegram)
+# ---------------------------------------------------------------------------
 
 # удаляем только "странные" управляющие символы, но оставляем \t, \n, \r
-CODES_TO_REMOVE = set(
-    c for c in range(0, 32) if c not in (9, 10, 13)
-)
+CODES_TO_REMOVE = {c for c in range(0, 32) if c not in (9, 10, 13)}
 CODES_TO_REMOVE.add(127)  # DEL
 
 # иногда проблемы создают спец. разделители строк из Юникода
@@ -63,8 +67,32 @@ def sanitize_text(text: str) -> str:
     return "".join(result_chars)
 
 
+async def safe_answer_message(msg: types.Message, text: str, **kwargs):
+    """
+    Безопасная отправка: чистим текст и отправляем БЕЗ parse_mode.
+    Если что-то падает – пишем в лог и молча возвращаем None.
+    """
+    try:
+        safe_text = sanitize_text(text)
+        return await msg.answer(safe_text, **kwargs)
+    except Exception:
+        logging.exception("Failed to send message")
+        return None
 
-# ----- BOT & APP SETUP -----
+
+async def safe_send_to_user(bot: Bot, chat_id: int, text: str, **kwargs):
+    """То же самое, но для bot.send_message(...)."""
+    try:
+        safe_text = sanitize_text(text)
+        return await bot.send_message(chat_id, safe_text, **kwargs)
+    except Exception:
+        logging.exception("Failed to send bot.send_message")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# BOT & APP SETUP
+# ---------------------------------------------------------------------------
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
@@ -79,8 +107,9 @@ app = FastAPI()
 user_last_word: dict[int, int] = {}
 
 
-# ----- Pydantic models for sync endpoints -----
-
+# ---------------------------------------------------------------------------
+# Pydantic models for sync endpoints
+# ---------------------------------------------------------------------------
 
 class WordIn(BaseModel):
     sheet_row: int
@@ -105,8 +134,9 @@ class SyncWordsRequest(BaseModel):
     mistakes_log: Optional[List[MistakeLogIn]] = None
 
 
-# ----- Helper functions -----
-
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
     """Build the question text and inline keyboard for a single word."""
@@ -148,23 +178,23 @@ async def send_mistakes_to_user(user_id: int, limit: int = 50):
     """Send last mistakes to a user as separate messages."""
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
-        await bot.send_message(user_id, "No mistakes logged yet ✅")
+        await safe_send_to_user(bot, user_id, "No mistakes logged yet ✅")
         return
 
     # Header message
-    await bot.send_message(user_id, "Words you should review:\n")
+    await safe_send_to_user(bot, user_id, "Words you should review:\n")
 
     # Each word in a separate message: question, 2 blank lines, answer
     for row in rows:
         q = row["question"]
         a = row["answer"]
         text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
-        text = sanitize_text(text)
-        await bot.send_message(user_id, text)
+        await safe_send_to_user(bot, user_id, text)
 
 
-# ----- Bot handlers -----
-
+# ---------------------------------------------------------------------------
+# Bot handlers
+# ---------------------------------------------------------------------------
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -177,14 +207,14 @@ async def cmd_start(message: types.Message):
         "I'm a bot for training German vocabulary.\n"
         "Use /next to get the first card.\n\n"
         "For each card choose:\n"
-        "• ✅ *I know* – if you remember the word\n"
-        "• ❌ *I don't know* – if you don't\n"
-        "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
+        "• I know – if you remember the word\n"
+        "• I don't know – if you don't\n"
+        "• I was wrong – if you realise your last answer was wrong.\n\n"
         "You can also use:\n"
         "• /mistakes – to see your latest mistakes\n"
         "• /stats – to see your current statistics."
     )
-    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
+    await safe_answer_message(message, text)
 
 
 @dp.message(Command("next"))
@@ -200,7 +230,7 @@ async def cmd_next(message: types.Message):
 
     due_count = await get_due_count()
     text, keyboard = build_question_message(row, due_count)
-    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    await safe_answer_message(message, text, reply_markup=keyboard)
 
 
 @dp.message(Command("mistakes"))
@@ -223,14 +253,14 @@ async def cmd_stats(message: types.Message):
     s = await get_stats(user_id)
 
     text = (
-        "📊 *Your stats*\n\n"
-        f"• Total words in deck: *{s['total_words']}*\n"
-        f"• Words due now: *{s['due_now']}*\n"
-        f"• Well-known words (progress ≥ 5): *{s['well_known']}*\n"
-        f"• Total mistakes logged: *{s['mistakes_total']}*"
+        "📊 Your stats\n\n"
+        f"• Total words in deck: {s['total_words']}\n"
+        f"• Words due now: {s['due_now']}\n"
+        f"• Well-known words (progress ≥ 5): {s['well_known']}\n"
+        f"• Total mistakes logged: {s['mistakes_total']}"
     )
 
-    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
+    await safe_answer_message(message, text)
 
 
 @dp.callback_query(F.data.startswith("ans"))
@@ -264,7 +294,7 @@ async def handle_answer(callback: types.CallbackQuery):
             "🔁 Previous word corrected.\n"
             f"📉 Progress -1 = {new_progress}"
         )
-        await callback.message.answer(sanitize_text(text))
+        await safe_answer_message(callback.message, text)
         await callback.answer()
         return
 
@@ -315,7 +345,7 @@ async def handle_answer(callback: types.CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer(final_text, parse_mode=ParseMode.MARKDOWN)
+        await safe_answer_message(callback.message, final_text)
         await callback.answer()
         return
 
@@ -330,17 +360,18 @@ async def handle_answer(callback: types.CallbackQuery):
     except Exception:
         pass
 
-    await callback.message.answer(
+    await safe_answer_message(
+        callback.message,
         full_text,
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=next_keyboard,
     )
 
     await callback.answer()
 
 
-# ----- FastAPI lifecycle -----
-
+# ---------------------------------------------------------------------------
+# FastAPI lifecycle
+# ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def on_startup():
@@ -353,8 +384,9 @@ async def root():
     return {"status": "ok", "message": "vocab-bot is running"}
 
 
-# ----- Sync endpoints for Google Sheets -----
-
+# ---------------------------------------------------------------------------
+# Sync endpoints for Google Sheets
+# ---------------------------------------------------------------------------
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
@@ -439,8 +471,9 @@ async def sync_progress():
     return {"status": "ok", "items": items, "mistakes_log": mistakes_out}
 
 
-# ----- Telegram webhook -----
-
+# ---------------------------------------------------------------------------
+# Telegram webhook
+# ---------------------------------------------------------------------------
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -450,8 +483,9 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-# ----- Daily mistakes cron endpoint -----
-
+# ---------------------------------------------------------------------------
+# Daily mistakes cron endpoint
+# ---------------------------------------------------------------------------
 
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
