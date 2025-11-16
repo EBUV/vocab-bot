@@ -63,6 +63,7 @@ def sanitize_text(text: str) -> str:
     return "".join(result_chars)
 
 
+
 # ----- BOT & APP SETUP -----
 
 if not BOT_TOKEN:
