@@ -494,6 +494,7 @@ async def telegram_webhook(request: Request):
 # ----- Daily mistakes cron endpoint -----
 
 
+
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
     """

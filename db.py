@@ -316,8 +316,8 @@ async def log_mistake(user_id: int, word_id: int) -> None:
 
 async def get_last_mistakes(user_id: int, limit: int = 60):
     """
-    Возвращает последние `limit` ошибок пользователя,
-    но в порядке от старых к новым.
+    Возвращает ошибки пользователя,
+    строго в порядке от старых к новым.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -328,18 +328,18 @@ async def get_last_mistakes(user_id: int, limit: int = 60):
         FROM mistakes m
         JOIN words w ON w.sheet_row = m.sheet_row
         WHERE m.user_id = ?
-        ORDER BY m.ts DESC
+        ORDER BY m.ts ASC
         LIMIT ?
         """,
         (user_id, limit),
     )
+
     rows = cur.fetchall()
     conn.close()
 
-    # сейчас rows отсортированы от новых к старым → разворачиваем
-    rows_list = list(rows)
-    rows_list.reverse()
-    return rows_list
+    return rows
+
+
 
 
 async def get_users_with_mistakes() -> List[int]:
