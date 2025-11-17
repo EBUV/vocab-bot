@@ -60,6 +60,7 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
+        # базовая схема
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS words (
@@ -88,9 +89,25 @@ async def init_db() -> None:
             """
         )
 
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_words_sheet_row ON words(sheet_row)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_words_next_due ON words(next_due_ts)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_mistakes_user_ts ON mistakes_log(user_id, ts)")
+        # --- МИГРАЦИИ ДЛЯ СТАРЫХ БАЗ ---
+        # если старая таблица была без mistakes_count – аккуратно добавим
+        try:
+            await db.execute(
+                "ALTER TABLE words ADD COLUMN mistakes_count INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            # колонка уже есть – просто игнорируем
+            pass
+
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_words_sheet_row ON words(sheet_row)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_words_next_due ON words(next_due_ts)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mistakes_user_ts ON mistakes_log(user_id, ts)"
+        )
         await db.commit()
 
 
@@ -170,7 +187,7 @@ async def decrement_progress(word_id: int) -> None:
     - if progress > 6 -> progress -2
       else -> progress -1
     - last_success_ts = NULL
-    - next_due_ts = NULL  (word becomes due immediately like "new")
+    - next_due_ts = NULL  (word becomes "new"/immediately due)
     """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -234,7 +251,7 @@ async def replace_all_words(words: List[Word]) -> None:
                     w.answer,
                     w.example,
                     w.last_success_ts,
-                    None,  # next_due_ts пересчитаем по мере ответов
+                    None,  # next_due_ts пересчитается по мере ответов
                     w.mistakes_count,
                 ),
             )
@@ -301,7 +318,6 @@ async def get_last_mistakes(user_id: int, limit: int = 60):
         rows = await cur.fetchall()
         await cur.close()
 
-    # rows сейчас от новых к старым, разворачиваем список
     rows_list = [dict(r) for r in rows]
     rows_list.reverse()
     return rows_list
@@ -348,7 +364,6 @@ async def replace_all_mistakes(entries: List[Tuple[int, int, int]]) -> None:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM mistakes_log")
-        # восстановим также mistakes_count
         await db.execute("UPDATE words SET mistakes_count = 0")
 
         for user_id, sheet_row, ts_sec in entries:
