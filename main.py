@@ -188,26 +188,28 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 60):
-    """
-    Отправляем пользователю последние ошибки.
-    Требование:
-      * 60 штук
-      * сначала старые, потом новые
-    """
+    """Send last mistakes to a user as separate messages."""
+    # забираем последние N ошибок (скорее всего в порядке "сначала новые")
     rows = await get_last_mistakes(user_id, limit=limit)
+
+    # инвертируем порядок: сначала старые, потом новые
+    rows = list(rows)
+    rows.reverse()
+
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
-    # get_last_mistakes обычно отдаёт от новых к старым -> переворачиваем
-    rows = list(reversed(rows))
 
+    # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
+
+    # Each word in a separate message: question, 2 blank lines, answer
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"  # две пустые строки между вопросом и ответом
+        text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
         text = sanitize_text(text)
         await bot.send_message(user_id, text)
 
