@@ -1,13 +1,63 @@
 # db.py
+import sqlite3
 import time
+import random
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-import aiosqlite
+from typing import Optional, List, Tuple, Dict
 
 from config import DB_PATH
 
-# ---- Dataclass for importing from Google Sheets ----
+# ---------- helpers ----------
+
+
+def get_connection() -> sqlite3.Connection:
+    """
+    Open SQLite connection with row_factory=Row
+    so we can use row["column_name"] everywhere.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# интервалы в МИНУТАХ для соответствующих уровней прогресса
+# Irina's table: 1, 30, 240, 1440, 2880, 5760, 11520, 23040, 46080, 92160, 138240, 213120
+LEVEL_TO_MINUTES: Dict[int, int] = {
+    0: 1,       # для 0 берём как для 1
+    1: 1,
+    2: 30,
+    3: 240,
+    4: 1440,
+    5: 2880,
+    6: 5760,
+    7: 11520,
+    8: 23040,
+    9: 46080,
+    10: 92160,
+    11: 138240,
+    12: 213120,
+}
+
+
+def progress_to_minutes(progress: int) -> int:
+    if progress <= 0:
+        return LEVEL_TO_MINUTES[0]
+    if progress >= 12:
+        return LEVEL_TO_MINUTES[12]
+    return LEVEL_TO_MINUTES.get(progress, LEVEL_TO_MINUTES[12])
+
+
+def compute_next_due_ts(last_success_ts: Optional[int], progress: int) -> int:
+    """
+    last_success_ts – unix time (sec).
+    Если None – считаем от текущего момента.
+    """
+    base = last_success_ts if last_success_ts is not None else int(time.time())
+    minutes = progress_to_minutes(progress)
+    return base + minutes * 60
+
+
+# ---------- dataclass for import ----------
 
 @dataclass
 class Word:
@@ -20,411 +70,463 @@ class Word:
     mistakes_count: int = 0
 
 
-# ---- Spaced-repetition intervals (in minutes) ----
-# level: minutes  (based on your sheet: 1, 30, 240, 1440, ...)
-INTERVALS_MIN = {
-    0: 1,
-    1: 1,
-    2: 30,
-    3: 240,
-    4: 1440,
-    5: 2880,
-    6: 5760,
-    7: 11520,
-    8: 23040,
-    9: 46080,
-    10: 92160,
-    11: 138240,
-    12: 213120,  # 12+
-}
-
-MAX_LEVEL = 12
-
-
-def _calc_next_due_ts(progress: int, base_ts: int) -> int:
-    """
-    Calculate next_due_ts in seconds from given base_ts (usually "now").
-    """
-    if progress <= 0:
-        delay_min = INTERVALS_MIN[0]
-    elif progress in INTERVALS_MIN:
-        delay_min = INTERVALS_MIN[progress]
-    else:
-        delay_min = INTERVALS_MIN[MAX_LEVEL]
-    return base_ts + delay_min * 60
-
-
-# ---- DB init ----
+# ---------- schema & init ----------
 
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    conn = get_connection()
+    cur = conn.cursor()
 
-        # базовая схема
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS words (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                sheet_row       INTEGER NOT NULL,
-                progress        INTEGER NOT NULL DEFAULT 0,
-                question        TEXT NOT NULL,
-                answer          TEXT NOT NULL,
-                example         TEXT,
-                last_success_ts INTEGER,
-                next_due_ts     INTEGER,
-                mistakes_count  INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS words (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_row       INTEGER NOT NULL UNIQUE,
+            progress        INTEGER NOT NULL DEFAULT 0,
+            question        TEXT NOT NULL,
+            answer          TEXT NOT NULL,
+            example         TEXT,
+            last_success_ts INTEGER,
+            next_due_ts     INTEGER,
+            mistakes_count  INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
 
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mistakes_log (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id   INTEGER NOT NULL,
-                word_id   INTEGER NOT NULL,
-                ts        INTEGER NOT NULL,
-                FOREIGN KEY (word_id) REFERENCES words(id)
-            )
-            """
-        )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_words_next_due
+        ON words(next_due_ts);
+        """
+    )
 
-        # --- МИГРАЦИИ ДЛЯ СТАРЫХ БАЗ ---
-        # если старая таблица была без mistakes_count – аккуратно добавим
-        try:
-            await db.execute(
-                "ALTER TABLE words ADD COLUMN mistakes_count INTEGER NOT NULL DEFAULT 0"
-            )
-        except Exception:
-            # колонка уже есть – просто игнорируем
-            pass
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mistakes (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER NOT NULL,
+            word_id   INTEGER NOT NULL,
+            sheet_row INTEGER NOT NULL,
+            ts        INTEGER NOT NULL,
+            FOREIGN KEY(word_id) REFERENCES words(id)
+        );
+        """
+    )
 
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_words_sheet_row ON words(sheet_row)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_words_next_due ON words(next_due_ts)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mistakes_user_ts ON mistakes_log(user_id, ts)"
-        )
-        await db.commit()
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mistakes_user_ts
+        ON mistakes(user_id, ts);
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mistakes_sheet_row
+        ON mistakes(sheet_row);
+        """
+    )
+
+    conn.commit()
+    conn.close()
 
 
-# ---- Core helpers ----
+# ---------- core spaced repetition logic ----------
 
 async def get_next_word():
     """
-    Get one word that is due now (or never scheduled).
+    Возвращает одну строку из words в виде sqlite3.Row.
+    Логика:
+      1) сначала слова, которые уже "должники" (next_due_ts <= now или NULL),
+         случайное одно из них;
+      2) если должников нет – берём до 100 ближайших по времени и среди них
+         случайное;
+      3) если и их нет (пустая БД) – None.
     """
+    conn = get_connection()
+    cur = conn.cursor()
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT *
-            FROM words
-            WHERE next_due_ts IS NULL OR next_due_ts <= ?
-            ORDER BY
-                (next_due_ts IS NULL) DESC,   -- words never scheduled first
-                next_due_ts ASC
-            LIMIT 1
-            """,
-            (now,),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-    return row
 
+    # сначала должники
+    cur.execute(
+        """
+        SELECT * FROM words
+        WHERE next_due_ts IS NULL OR next_due_ts <= ?
+        ORDER BY RANDOM()
+        LIMIT 1
+        """,
+        (now,),
+    )
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row
 
-async def get_word_by_id(word_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM words WHERE id = ?", (word_id,))
-        row = await cur.fetchone()
-        await cur.close()
+    # ближайшие по времени (top 100)
+    cur.execute(
+        """
+        SELECT * FROM words
+        WHERE next_due_ts IS NOT NULL
+        ORDER BY next_due_ts ASC
+        LIMIT 100
+        """
+    )
+    rows = cur.fetchall()
+    if rows:
+        row = random.choice(rows)
+        conn.close()
+        return row
+
+    # fallback – любое слово
+    cur.execute("SELECT * FROM words ORDER BY RANDOM() LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
     return row
 
 
 async def increment_progress_and_update_due(word_id: int) -> int:
     """
-    Correct answer:
-    - progress +1 (capped at MAX_LEVEL)
-    - last_success_ts = now
-    - next_due_ts based on spaced-repetition interval.
-    Returns new progress.
+    Увеличиваем прогресс на 1 и обновляем last_success_ts / next_due_ts.
+    Возвращаем новый прогресс.
     """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT progress FROM words WHERE id = ?", (word_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return 0
+
+    progress = int(row["progress"]) + 1
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    next_due = compute_next_due_ts(now, progress)
 
-        cur = await db.execute("SELECT progress FROM words WHERE id = ?", (word_id,))
-        row = await cur.fetchone()
-        await cur.close()
-        if not row:
-            return 0
+    cur.execute(
+        """
+        UPDATE words
+        SET progress = ?, last_success_ts = ?, next_due_ts = ?
+        WHERE id = ?
+        """,
+        (progress, now, next_due, word_id),
+    )
 
-        old_progress = row["progress"] or 0
-        new_progress = min(old_progress + 1, MAX_LEVEL)
+    conn.commit()
+    conn.close()
+    return progress
 
-        next_due = _calc_next_due_ts(new_progress, now)
 
-        await db.execute(
-            """
-            UPDATE words
-            SET progress = ?, last_success_ts = ?, next_due_ts = ?
-            WHERE id = ?
-            """,
-            (new_progress, now, next_due, word_id),
-        )
-        await db.commit()
+async def decrement_progress(word_id: int) -> int:
+    """
+    Уменьшаем прогресс:
+      - если progress > 6 → минус 2
+      - иначе → минус 1
+    last_success_ts сбрасываем в NULL, next_due_ts ставим в now,
+    чтобы слово стало "должником".
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT progress FROM words WHERE id = ?", (word_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return 0
+
+    current = int(row["progress"])
+    step = 2 if current > 6 else 1
+    new_progress = max(0, current - step)
+    now = int(time.time())
+
+    cur.execute(
+        """
+        UPDATE words
+        SET progress = ?, last_success_ts = NULL, next_due_ts = ?
+        WHERE id = ?
+        """,
+        (new_progress, now, word_id),
+    )
+
+    conn.commit()
+    conn.close()
     return new_progress
 
 
-async def decrement_progress(word_id: int) -> None:
-    """
-    Wrong answer:
-    - if progress > 6 -> progress -2
-      else -> progress -1
-    - last_success_ts = NULL
-    - next_due_ts = NULL  (word becomes "new"/immediately due)
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        cur = await db.execute("SELECT progress FROM words WHERE id = ?", (word_id,))
-        row = await cur.fetchone()
-        await cur.close()
-        if not row:
-            return
-
-        old_progress = row["progress"] or 0
-        if old_progress > 6:
-            new_progress = max(0, old_progress - 2)
-        else:
-            new_progress = max(0, old_progress - 1)
-
-        await db.execute(
-            """
-            UPDATE words
-            SET progress = ?, last_success_ts = NULL, next_due_ts = NULL
-            WHERE id = ?
-            """,
-            (new_progress, word_id),
-        )
-        await db.commit()
+async def get_word_by_id(word_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM words WHERE id = ?", (word_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 
 async def get_due_count() -> int:
-    """
-    Number of words currently due.
-    """
+    conn = get_connection()
+    cur = conn.cursor()
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT COUNT(*) AS c FROM words WHERE next_due_ts IS NULL OR next_due_ts <= ?",
-            (now,),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-    return row["c"] if row else 0
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM words
+        WHERE next_due_ts IS NULL OR next_due_ts <= ?
+        """,
+        (now,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row["cnt"] if row else 0)
 
 
-# ---- Full replace from Google Sheets ----
-
-async def replace_all_words(words: List[Word]) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM words")
-
-        for w in words:
-            await db.execute(
-                """
-                INSERT INTO words (
-                    sheet_row, progress, question, answer, example,
-                    last_success_ts, next_due_ts, mistakes_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    w.sheet_row,
-                    w.progress,
-                    w.question,
-                    w.answer,
-                    w.example,
-                    w.last_success_ts,
-                    None,  # next_due_ts пересчитается по мере ответов
-                    w.mistakes_count,
-                ),
-            )
-
-        await db.commit()
-
-
-async def get_all_progress():
-    """
-    For sync back to Google Sheets.
-    Returns list of dicts:
-      sheet_row, progress, last_success_ts, mistakes_count
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT sheet_row, progress, last_success_ts, mistakes_count FROM words"
-        )
-        rows = await cur.fetchall()
-        await cur.close()
-    return rows
-
-
-# ---- Mistakes ----
+# ---------- mistakes ----------
 
 async def log_mistake(user_id: int, word_id: int) -> None:
-    now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            UPDATE words
-            SET mistakes_count = mistakes_count + 1
-            WHERE id = ?
-            """,
-            (word_id,),
-        )
-        await db.execute(
-            """
-            INSERT INTO mistakes_log (user_id, word_id, ts)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, word_id, now),
-        )
-        await db.commit()
+    """
+    Записываем ошибку в mistakes и увеличиваем mistakes_count у слова.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT sheet_row FROM words WHERE id = ?", (word_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+
+    sheet_row = int(row["sheet_row"])
+    ts = int(time.time())
+
+    cur.execute(
+        """
+        INSERT INTO mistakes (user_id, word_id, sheet_row, ts)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, word_id, sheet_row, ts),
+    )
+    cur.execute(
+        """
+        UPDATE words
+        SET mistakes_count = mistakes_count + 1
+        WHERE id = ?
+        """,
+        (word_id,),
+    )
+
+    conn.commit()
+    conn.close()
 
 
 async def get_last_mistakes(user_id: int, limit: int = 60):
     """
-    Get LAST <limit> mistakes of user, but ordered from OLDEST to NEWEST.
+    Возвращает последние `limit` ошибок пользователя,
+    но в порядке от старых к новым.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT m.ts, m.user_id, w.question, w.answer
-            FROM mistakes_log m
-            JOIN words w ON w.id = m.word_id
-            WHERE m.user_id = ?
-            ORDER BY m.ts DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-        rows = await cur.fetchall()
-        await cur.close()
+    conn = get_connection()
+    cur = conn.cursor()
 
-    rows_list = [dict(r) for r in rows]
+    cur.execute(
+        """
+        SELECT w.question, w.answer, m.ts
+        FROM mistakes m
+        JOIN words w ON w.sheet_row = m.sheet_row
+        WHERE m.user_id = ?
+        ORDER BY m.ts DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    # сейчас rows отсортированы от новых к старым → разворачиваем
+    rows_list = list(rows)
     rows_list.reverse()
     return rows_list
 
 
-async def get_users_with_mistakes():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT DISTINCT user_id FROM mistakes_log"
-        )
-        rows = await cur.fetchall()
-        await cur.close()
-    return [r["user_id"] for r in rows]
+async def get_users_with_mistakes() -> List[int]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM mistakes")
+    rows = cur.fetchall()
+    conn.close()
+    return [int(r["user_id"]) for r in rows]
 
 
 async def get_all_mistakes_for_sync():
     """
-    For syncing Log2 sheet: all mistake entries with sheet_row, question, answer.
+    Для экспорта в Google Sheets (Log2).
+    Возвращаем список строк с полями:
+      user_id, sheet_row, ts, question, answer
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT
-                m.user_id,
-                w.sheet_row,
-                m.ts,
-                w.question,
-                w.answer
-            FROM mistakes_log m
-            JOIN words w ON w.id = m.word_id
-            ORDER BY m.ts ASC
-            """
-        )
-        rows = await cur.fetchall()
-        await cur.close()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT m.user_id, m.sheet_row, m.ts, w.question, w.answer
+        FROM mistakes m
+        JOIN words w ON w.sheet_row = m.sheet_row
+        ORDER BY m.ts ASC, m.id ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
     return rows
 
 
 async def replace_all_mistakes(entries: List[Tuple[int, int, int]]) -> None:
     """
-    Replace entire mistakes_log with given list of tuples:
-    (user_id, sheet_row, ts_sec)
+    Полностью пересобираем таблицу mistakes.
+    entries: список кортежей (user_id, sheet_row, ts_sec).
+    После вставки пересчитываем mistakes_count в words.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM mistakes_log")
-        await db.execute("UPDATE words SET mistakes_count = 0")
+    conn = get_connection()
+    cur = conn.cursor()
 
+    cur.execute("DELETE FROM mistakes")
+
+    if entries:
+        # нужно сопоставить sheet_row с id слова
+        # сначала создаём map sheet_row -> id
+        cur.execute("SELECT id, sheet_row FROM words")
+        mapping = {int(r["sheet_row"]): int(r["id"]) for r in cur.fetchall()}
+
+        insert_rows = []
         for user_id, sheet_row, ts_sec in entries:
-            cur = await db.execute(
-                "SELECT id FROM words WHERE sheet_row = ?", (sheet_row,)
-            )
-            row = await cur.fetchone()
-            await cur.close()
-            if not row:
+            word_id = mapping.get(sheet_row)
+            if word_id is None:
                 continue
-            word_id = row["id"]
+            insert_rows.append((user_id, word_id, sheet_row, int(ts_sec)))
 
-            await db.execute(
-                """
-                INSERT INTO mistakes_log (user_id, word_id, ts)
-                VALUES (?, ?, ?)
-                """,
-                (user_id, word_id, ts_sec),
+        cur.executemany(
+            """
+            INSERT INTO mistakes (user_id, word_id, sheet_row, ts)
+            VALUES (?, ?, ?, ?)
+            """,
+            insert_rows,
+        )
+
+    # пересчёт mistakes_count
+    cur.execute("UPDATE words SET mistakes_count = 0")
+    cur.execute(
+        """
+        UPDATE words
+        SET mistakes_count = (
+            SELECT COUNT(*)
+            FROM mistakes m
+            WHERE m.sheet_row = words.sheet_row
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ---------- sync with Google Sheets ----------
+
+async def replace_all_words(words: List[Word]) -> None:
+    """
+    Полностью пересобираем таблицу words.
+    next_due_ts пересчитываем на основании last_success_ts и progress.
+    Если last_success_ts нет – слово считается уже "должником".
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM words")
+
+    now = int(time.time())
+
+    for w in words:
+        if w.last_success_ts is not None:
+            next_due = compute_next_due_ts(w.last_success_ts, w.progress)
+        else:
+            # если нет успешных ответов – сделать слово должником
+            next_due = now
+
+        cur.execute(
+            """
+            INSERT INTO words (
+                sheet_row, progress, question, answer, example,
+                last_success_ts, next_due_ts, mistakes_count
             )
-            await db.execute(
-                """
-                UPDATE words
-                SET mistakes_count = mistakes_count + 1
-                WHERE id = ?
-                """,
-                (word_id,),
-            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(w.sheet_row),
+                int(w.progress),
+                w.question,
+                w.answer,
+                w.example,
+                w.last_success_ts,
+                next_due,
+                int(w.mistakes_count or 0),
+            ),
+        )
 
-        await db.commit()
+    conn.commit()
+    conn.close()
 
 
-# ---- Stats ----
+async def get_all_progress():
+    """
+    Для экспорта в Google Sheets.
+    Возвращаем список строк с полями:
+      sheet_row, progress, last_success_ts, mistakes_count
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sheet_row, progress, last_success_ts, mistakes_count
+        FROM words
+        ORDER BY sheet_row ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ---------- stats ----------
 
 async def get_stats(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    conn = get_connection()
+    cur = conn.cursor()
+    now = int(time.time())
 
-        cur = await db.execute("SELECT COUNT(*) AS c FROM words")
-        total_words = (await cur.fetchone())["c"]
-        await cur.close()
+    cur.execute("SELECT COUNT(*) AS cnt FROM words")
+    total_words = int(cur.fetchone()["cnt"])
 
-        now = int(time.time())
-        cur = await db.execute(
-            "SELECT COUNT(*) AS c FROM words WHERE next_due_ts IS NULL OR next_due_ts <= ?",
-            (now,),
-        )
-        due_now = (await cur.fetchone())["c"]
-        await cur.close()
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM words
+        WHERE next_due_ts IS NULL OR next_due_ts <= ?
+        """,
+        (now,),
+    )
+    due_now = int(cur.fetchone()["cnt"])
 
-        cur = await db.execute(
-            "SELECT COUNT(*) AS c FROM words WHERE progress >= 5"
-        )
-        well_known = (await cur.fetchone())["c"]
-        await cur.close()
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM words
+        WHERE progress >= 5
+        """
+    )
+    well_known = int(cur.fetchone()["cnt"])
 
-        cur = await db.execute(
-            "SELECT COUNT(*) AS c FROM mistakes_log WHERE user_id = ?",
-            (user_id,),
-        )
-        mistakes_total = (await cur.fetchone())["c"]
-        await cur.close()
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM mistakes
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+    mistakes_total = int(cur.fetchone()["cnt"])
+
+    conn.close()
 
     return {
         "total_words": total_words,
