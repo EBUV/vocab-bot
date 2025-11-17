@@ -1,8 +1,9 @@
+# main.py
 import logging
 
 logging.basicConfig(level=logging.INFO)
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
@@ -23,7 +24,6 @@ from db import (
     get_all_progress,
     get_all_mistakes_for_sync,
     get_due_count,
-    Word,
     get_word_by_id,
     log_mistake,
     get_last_mistakes,
@@ -42,56 +42,38 @@ def is_allowed(user_id: int) -> bool:
 
 # ----- TEXT SANITIZING (remove problematic chars for Telegram) -----
 
-# Remove most control chars, but keep \t, \n, \r
+# Удаляем только странные управляющие символы, но оставляем \t, \n, \r
 CODES_TO_REMOVE = {c for c in range(0, 32) if c not in (9, 10, 13)}
 CODES_TO_REMOVE.add(127)  # DEL
 
-# Rare Unicode line/paragraph separators
+# Иногда проблемы создают спец. разделители строк из Юникода
 UNICODE_BAD_CODES = {0x2028, 0x2029}
 
 
 def sanitize_text(text: str) -> str:
+    """Remove characters that Telegram may not like (control chars etc.)."""
     if not text:
         return text
-    res = []
+    result_chars = []
     for ch in text:
         code = ord(ch)
         if code in CODES_TO_REMOVE or code in UNICODE_BAD_CODES:
             continue
-        res.append(ch)
-    return "".join(res)
-
-
-def escape_markdown(text: str) -> str:
-    """Escape MarkdownV2 special characters."""
-    if not text:
-        return text
-    special = r"_*[]()~`>#+-=|{}.!\\"  # Telegram MarkdownV2 special chars
-    out = []
-    for ch in text:
-        if ch in special:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
+        result_chars.append(ch)
+    return "".join(result_chars)
 
 
 async def safe_answer_message(msg: types.Message, text: str, **kwargs):
     """
-    Try to send with MarkdownV2, fall back to plain text if it fails.
+    Отправка сообщения с предварительной очисткой текста.
+    Без parse_mode, чтобы не спотыкаться о Markdown.
     """
     try:
-        safe = sanitize_text(text)
-        md = escape_markdown(safe)
-        return await msg.answer(md, parse_mode=ParseMode.MARKDOWN_V2, **kwargs)
+        safe_text = sanitize_text(text)
+        return await msg.answer(safe_text, **kwargs)
     except Exception:
-        logging.exception("Failed to send markdown message, retrying without markdown")
-        try:
-            safe = sanitize_text(text)
-            return await msg.answer(safe, **kwargs)
-        except Exception:
-            logging.exception("Failed to send plain text message as well")
-            return None
+        logging.exception("Failed to send message (plain text)")
+        return None
 
 
 # ----- BOT & APP SETUP -----
@@ -111,22 +93,23 @@ user_last_word: dict[int, int] = {}
 
 # ----- Pydantic models for sync endpoints -----
 
+
 class WordIn(BaseModel):
     sheet_row: int
     progress: int
     question: str
     answer: str
     example: Optional[str] = None
-    # Date.now() in ms
+    # milliseconds (Date.now()), may be omitted
     last_success_ts_ms: Optional[int] = None
-    # mistakes counter from column I
+    # total mistakes count for this word (column I)
     mistakes_count: Optional[int] = 0
 
 
 class MistakeLogIn(BaseModel):
     user_id: int
     sheet_row: int
-    ts_ms: int  # timestamp in milliseconds
+    ts_ms: int  # timestamp in milliseconds (Date.now)
 
 
 class SyncWordsRequest(BaseModel):
@@ -136,7 +119,9 @@ class SyncWordsRequest(BaseModel):
 
 # ----- Helper functions -----
 
+
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the question text and inline keyboard for a single word."""
     word_id = row["id"]
     progress = row["progress"]
     question = row["question"]
@@ -166,29 +151,38 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
             ]
         ]
     )
+
     return text, keyboard
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 60):
     """
     Send last mistakes to a user as separate messages.
-    `get_last_mistakes` уже отдаёт их в нужном порядке (старые → новые).
+
+    ВАЖНО: выдаём в обратном порядке — сперва старые, потом новые.
     """
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
+    # Разворачиваем, чтобы сначала шли более старые ошибки
+    rows = list(reversed(rows))
+
+    # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
+    # Each word in a separate message: question, 2 blank lines, answer
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = sanitize_text(f"{q}\n\n\n{a}")
+        text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
+        text = sanitize_text(text)
         await bot.send_message(user_id, text)
 
 
 # ----- Bot handlers -----
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -201,14 +195,15 @@ async def cmd_start(message: types.Message):
         "I'm a bot for training German vocabulary.\n"
         "Use /next to get the first card.\n\n"
         "For each card choose:\n"
-        "• ✅ *I know* – if you remember the word\n"
-        "• ❌ *I don't know* – if you don't\n"
-        "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
+        "• ✅ I know – if you remember the word\n"
+        "• ❌ I don't know – if you don't\n"
+        "• ↩️ I was wrong – if you realise your last answer was wrong.\n\n"
         "You can also use:\n"
         "• /mistakes – to see your latest mistakes\n"
         "• /stats – to see your current statistics."
     )
-    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
+    # Здесь текст статический, поэтому можно спокойно использовать Markdown
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.message(Command("next"))
@@ -254,7 +249,8 @@ async def cmd_stats(message: types.Message):
         f"• Total mistakes logged: *{s['mistakes_total']}*"
     )
 
-    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
+    # Тут тоже текст без данных из словаря, можно оставить Markdown
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.callback_query(F.data.startswith("ans"))
@@ -280,16 +276,24 @@ async def handle_answer(callback: types.CallbackQuery):
             return
 
         old_progress = row["progress"]
-        await decrement_progress(last_id)       # внутри БД обнуляем last_success_ts
-        await log_mistake(user_id, last_id)
-        step = 2 if old_progress > 6 else 1
-        new_progress = max(0, old_progress - step)
 
-        text = sanitize_text(
+        # Если прогресс высокий (>6) — уменьшаем на 2, иначе на 1
+        if old_progress > 6:
+            await decrement_progress(last_id)
+            await decrement_progress(last_id)
+            new_progress = max(0, old_progress - 2)
+        else:
+            await decrement_progress(last_id)
+            new_progress = max(0, old_progress - 1)
+
+        # Логируем ошибку, но ВРЕМЯ НЕ ТРОГАЕМ (last_success_ts не меняется)
+        await log_mistake(user_id, last_id)
+
+        text = (
             "🔁 Previous word corrected.\n"
-            f"📉 Progress -{step} = {new_progress}"
+            f"📉 Progress decreased to {new_progress}"
         )
-        await callback.message.answer(text)
+        await safe_answer_message(callback.message, text)
         await callback.answer()
         return
 
@@ -307,20 +311,31 @@ async def handle_answer(callback: types.CallbackQuery):
         return
 
     user_last_word[user_id] = word_id
+
     old_progress = row["progress"]
 
+    # === Правильный ответ ===
     if verdict == "know":
+        # Здесь и только здесь обновляем last_success_ts и next_due_ts
         delta = 1
         new_progress = await increment_progress_and_update_due(word_id)
-    else:
-        # "I don't know" → уменьшаем прогресс, сбрасываем таймер, пишем ошибку
-        delta = -1
-        await decrement_progress(word_id)       # внутри БД обнуляем last_success_ts
-        await log_mistake(user_id, word_id)
-        step = 2 if old_progress > 6 else 1
-        new_progress = max(0, old_progress - step)
+    # === Неправильный ответ / "I don't know" ===
+    else:  # verdict == "dont"
+        # Для высоких прогрессов > 6 уменьшаем на 2, иначе на 1
+        if old_progress > 6:
+            await decrement_progress(word_id)
+            await decrement_progress(word_id)
+            delta = -2
+            new_progress = max(0, old_progress - 2)
+        else:
+            await decrement_progress(word_id)
+            delta = -1
+            new_progress = max(0, old_progress - 1)
 
-    sign = "+" if delta > 0 else "-"
+        # Логируем ошибку, НО last_success_ts не трогаем
+        await log_mistake(user_id, word_id)
+
+    sign = "+" if delta > 0 else ""
 
     question = row["question"]
     answer = row["answer"]
@@ -329,40 +344,49 @@ async def handle_answer(callback: types.CallbackQuery):
     prev_part = f"{question}\n\n{answer}"
     if example:
         prev_part += f"\n\n{example}"
-    prev_part += f"\n\n📈 Progress {sign}{abs(delta)} = {new_progress}"
+    prev_part += f"\n\n📈 Progress {sign}{delta} = {new_progress}"
+
     prev_part = sanitize_text(prev_part)
 
     next_row = await get_next_word()
     if not next_row:
-        final_text = sanitize_text(prev_part + "\n\nNo more words in the database.")
+        final_text = prev_part + "\n\nNo more words in the database."
+        final_text = sanitize_text(final_text)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer(final_text)
+        await safe_answer_message(callback.message, final_text)
         await callback.answer()
         return
 
     due_count = await get_due_count()
     next_text, next_keyboard = build_question_message(next_row, due_count)
 
-    full_text = sanitize_text(prev_part + "\n\n---\n\n" + next_text)
+    full_text = prev_part + "\n\n---\n\n" + next_text
+    full_text = sanitize_text(full_text)
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    await callback.message.answer(full_text, reply_markup=next_keyboard)
+    await safe_answer_message(
+        callback.message,
+        full_text,
+        reply_markup=next_keyboard,
+    )
+
     await callback.answer()
 
 
 # ----- FastAPI lifecycle -----
 
+
 @app.on_event("startup")
 async def on_startup():
     await init_db()
-    logging.info("DB initialized")
+    print("DB initialized")
 
 
 @app.get("/")
@@ -372,94 +396,93 @@ async def root():
 
 # ----- Sync endpoints for Google Sheets -----
 
+
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
     """
-    Import from Google Sheets:
-    - words: основной словарь
-    - mistakes_log: полный лог ошибок (Log2)
+    Import from Google Sheets.
+
+    last_success_ts_ms is given in milliseconds (Date.now()).
+    Inside we store last_success_ts in seconds and compute next_due_ts.
+    mistakes_log: full mistakes history from Log2.
     """
-    try:
-        words: List[Word] = []
-        for w in payload.words:
-            if w.last_success_ts_ms is not None:
-                last_success_sec = int(w.last_success_ts_ms // 1000)
-            else:
-                last_success_sec = None
+    # Здесь снова используем обычные dict'ы, чтобы не ломать db.replace_all_words
+    words: List[dict] = []
+    for w in payload.words:
+        if w.last_success_ts_ms is not None:
+            last_success_sec = int(w.last_success_ts_ms // 1000)
+        else:
+            last_success_sec = None
 
-            words.append(
-                Word(
-                    sheet_row=w.sheet_row,
-                    progress=w.progress,
-                    question=w.question,
-                    answer=w.answer,
-                    example=w.example,
-                    last_success_ts=last_success_sec,
-                    mistakes_count=w.mistakes_count or 0,
-                )
-            )
+        words.append(
+            {
+                "sheet_row": w.sheet_row,
+                "progress": w.progress,
+                "question": w.question,
+                "answer": w.answer,
+                "example": w.example,
+                "last_success_ts": last_success_sec,
+                "mistakes_count": w.mistakes_count or 0,
+            }
+        )
 
-        # Полностью пересобираем таблицу слов
-        await replace_all_words(words)
+    # Rebuild words table
+    await replace_all_words(words)
 
-        # Полностью пересобираем лог ошибок
-        entries: list[tuple[int, int, int]] = []
-        if payload.mistakes_log:
-            for m in payload.mistakes_log:
-                ts_sec = int(m.ts_ms // 1000)
-                entries.append((m.user_id, m.sheet_row, ts_sec))
+    # Rebuild mistakes log (if provided)
+    entries: list[tuple[int, int, int]] = []
+    if payload.mistakes_log:
+        for m in payload.mistakes_log:
+            ts_sec = int(m.ts_ms // 1000)
+            entries.append((m.user_id, m.sheet_row, ts_sec))
 
-        await replace_all_mistakes(entries)
-
-        return {"status": "ok", "count": len(words), "mistakes": len(entries)}
-    except Exception as e:
-        logging.exception("sync_words failed")
-        # Это сообщение теперь увидишь в алерте Гугл-таблицы
-        raise HTTPException(status_code=500, detail=f"sync_words error: {e}")
+    await replace_all_mistakes(entries)
+    return {"status": "ok", "count": len(words), "mistakes": len(entries)}
 
 
 @app.get("/sync/progress")
 async def sync_progress():
     """
-    Export to Google Sheets:
-    - items: прогресс по словам + last_success_ts_ms + mistakes_count
-    - mistakes_log: полный лог ошибок для листа Log2
+    Export to Google Sheets.
+
+    - items: per-word progress + last_success_ts_ms + mistakes_count
+    - mistakes_log: full mistakes history (Log2 sheet)
     """
-    try:
-        word_items_raw = await get_all_progress()
-        items = []
-        for item in word_items_raw:
-            ts = item["last_success_ts"]
-            ts_ms = int(ts * 1000) if ts is not None else None
-            items.append(
-                {
-                    "sheet_row": item["sheet_row"],
-                    "progress": item["progress"],
-                    "last_success_ts_ms": ts_ms,
-                    "mistakes_count": item["mistakes_count"],
-                }
-            )
+    word_items_raw = await get_all_progress()
+    items = []
+    for item in word_items_raw:
+        ts = item["last_success_ts"]
+        if ts is not None:
+            ts_ms = int(ts * 1000)
+        else:
+            ts_ms = None
+        items.append(
+            {
+                "sheet_row": item["sheet_row"],
+                "progress": item["progress"],
+                "last_success_ts_ms": ts_ms,
+                "mistakes_count": item["mistakes_count"],
+            }
+        )
 
-        mistakes_raw = await get_all_mistakes_for_sync()
-        mistakes_out = []
-        for row in mistakes_raw:
-            mistakes_out.append(
-                {
-                    "user_id": row["user_id"],
-                    "sheet_row": row["sheet_row"],
-                    "ts_ms": int(row["ts"] * 1000),
-                    "question": row["question"],
-                    "answer": row["answer"],
-                }
-            )
+    mistakes_raw = await get_all_mistakes_for_sync()
+    mistakes_out = []
+    for row in mistakes_raw:
+        mistakes_out.append(
+            {
+                "user_id": row["user_id"],
+                "sheet_row": row["sheet_row"],
+                "ts_ms": int(row["ts"] * 1000),
+                "question": row["question"],
+                "answer": row["answer"],
+            }
+        )
 
-        return {"status": "ok", "items": items, "mistakes_log": mistakes_out}
-    except Exception as e:
-        logging.exception("sync_progress failed")
-        raise HTTPException(status_code=500, detail=f"sync_progress error: {e}")
+    return {"status": "ok", "items": items, "mistakes_log": mistakes_out}
 
 
 # ----- Telegram webhook -----
+
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -471,8 +494,13 @@ async def telegram_webhook(request: Request):
 
 # ----- Daily mistakes cron endpoint -----
 
+
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
+    """
+    Endpoint to be called by an external scheduler (cron).
+    For each user who has mistakes logged, send them last N mistakes.
+    """
     user_ids = await get_users_with_mistakes()
     for uid in user_ids:
         if is_allowed(uid):
