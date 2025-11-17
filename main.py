@@ -1,50 +1,46 @@
 # main.py
 import logging
-
-logging.basicConfig(level=logging.INFO)
+from typing import List, Optional
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pydantic import BaseModel
 
 from config import BOT_TOKEN, WEBHOOK_PATH
-from pydantic import BaseModel
-from typing import List, Optional
-
 from db import (
-    init_db,
-    get_next_word,
-    increment_progress_and_update_due,
-    decrement_progress,
-    replace_all_words,
-    replace_all_mistakes,
-    get_all_progress,
-    get_all_mistakes_for_sync,
-    get_due_count,
     Word,
-    get_word_by_id,
-    log_mistake,
+    decrement_progress,
+    get_all_mistakes_for_sync,
+    get_all_progress,
+    get_due_count,
     get_last_mistakes,
-    get_users_with_mistakes,
+    get_next_word,
     get_stats,
+    get_users_with_mistakes,
+    get_word_by_id,
+    increment_progress_and_update_due,
+    init_db,
+    log_mistake,
+    replace_all_mistakes,
+    replace_all_words,
 )
 
-# ---------------------------------------------------------------------------
-# ACCESS CONTROL
-# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
 
-ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
+# ----- ACCESS CONTROL -----
+
+ALLOWED_USER_IDS = {518129411}  # твой Telegram ID
 
 
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-# ---------------------------------------------------------------------------
-# TEXT SANITIZING (remove problematic chars for Telegram)
-# ---------------------------------------------------------------------------
+# ----- TEXT SANITIZING (remove problematic chars for Telegram) -----
 
 # удаляем только "странные" управляющие символы, но оставляем \t, \n, \r
 CODES_TO_REMOVE = {c for c in range(0, 32) if c not in (9, 10, 13)}
@@ -67,32 +63,47 @@ def sanitize_text(text: str) -> str:
     return "".join(result_chars)
 
 
+def escape_markdown(text: str) -> str:
+    """
+    Аккуратно экранируем спецсимволы Markdown V2,
+    если захотим послать текст с parse_mode=MARKDOWN_V2.
+    """
+    if not text:
+        return text
+    special = r"_*[]()~`>#+-=|{}.!\\"  # набор спец-символов
+    escaped = []
+    for ch in text:
+        if ch in special:
+            escaped.append("\\" + ch)
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
+
+
 async def safe_answer_message(msg: types.Message, text: str, **kwargs):
     """
-    Безопасная отправка: чистим текст и отправляем БЕЗ parse_mode.
-    Если что-то падает – пишем в лог и молча возвращаем None.
+    Пытаемся отправить с Markdown V2.
+    Если падает – логируем и пробуем без форматирования.
     """
     try:
         safe_text = sanitize_text(text)
-        return await msg.answer(safe_text, **kwargs)
+        md_text = escape_markdown(safe_text)
+        return await msg.answer(
+            md_text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            **kwargs,
+        )
     except Exception:
-        logging.exception("Failed to send message")
-        return None
+        logging.exception("Failed to send markdown message, retrying without markdown")
+        try:
+            safe_text = sanitize_text(text)
+            return await msg.answer(safe_text, **kwargs)
+        except Exception:
+            logging.exception("Failed to send plain text message as well")
+            return None
 
 
-async def safe_send_to_user(bot: Bot, chat_id: int, text: str, **kwargs):
-    """То же самое, но для bot.send_message(...)."""
-    try:
-        safe_text = sanitize_text(text)
-        return await bot.send_message(chat_id, safe_text, **kwargs)
-    except Exception:
-        logging.exception("Failed to send bot.send_message")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# BOT & APP SETUP
-# ---------------------------------------------------------------------------
+# ----- BOT & APP SETUP -----
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set env var BOT_TOKEN or in config.py.")
@@ -107,9 +118,7 @@ app = FastAPI()
 user_last_word: dict[int, int] = {}
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models for sync endpoints
-# ---------------------------------------------------------------------------
+# ----- Pydantic models for sync endpoints -----
 
 class WordIn(BaseModel):
     sheet_row: int
@@ -117,16 +126,14 @@ class WordIn(BaseModel):
     question: str
     answer: str
     example: Optional[str] = None
-    # milliseconds (Date.now()), may be omitted
-    last_success_ts_ms: Optional[int] = None
-    # total mistakes count for this word (column I)
-    mistakes_count: Optional[int] = 0
+    last_success_ts_ms: Optional[int] = None  # Date.now() ms
+    mistakes_count: Optional[int] = 0         # column I
 
 
 class MistakeLogIn(BaseModel):
     user_id: int
     sheet_row: int
-    ts_ms: int  # timestamp in milliseconds (Date.now)
+    ts_ms: int  # timestamp in ms (Date.now)
 
 
 class SyncWordsRequest(BaseModel):
@@ -134,9 +141,7 @@ class SyncWordsRequest(BaseModel):
     mistakes_log: Optional[List[MistakeLogIn]] = None
 
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
+# ----- Helper functions -----
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
     """Build the question text and inline keyboard for a single word."""
@@ -149,23 +154,19 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
         f"📈 Current progress: {progress}\n"
         f"📚 Words due now: {due_count}"
     )
-
     text = sanitize_text(text)
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ I know",
-                    callback_data=f"ans:{word_id}:know",
+                    text="✅ I know", callback_data=f"ans:{word_id}:know"
                 ),
                 InlineKeyboardButton(
-                    text="❌ I don't know",
-                    callback_data=f"ans:{word_id}:dont",
+                    text="❌ I don't know", callback_data=f"ans:{word_id}:dont"
                 ),
                 InlineKeyboardButton(
-                    text="↩️ I was wrong",
-                    callback_data="ans:fix",
+                    text="↩️ I was wrong", callback_data="ans:fix"
                 ),
             ]
         ]
@@ -174,27 +175,27 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
     return text, keyboard
 
 
-async def send_mistakes_to_user(user_id: int, limit: int = 50):
-    """Send last mistakes to a user as separate messages."""
+async def send_mistakes_to_user(user_id: int, limit: int = 60):
+    """
+    Send last <limit> mistakes to user.
+    Порядок: от старых к новым.
+    """
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
-        await safe_send_to_user(bot, user_id, "No mistakes logged yet ✅")
+        await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
-    # Header message
-    await safe_send_to_user(bot, user_id, "Words you should review:\n")
+    await bot.send_message(user_id, "Words you should review:\n")
 
-    # Each word in a separate message: question, 2 blank lines, answer
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"  # two empty lines between question and answer
-        await safe_send_to_user(bot, user_id, text)
+        text = f"{q}\n\n\n{a}"
+        text = sanitize_text(text)
+        await bot.send_message(user_id, text)
 
 
-# ---------------------------------------------------------------------------
-# Bot handlers
-# ---------------------------------------------------------------------------
+# ----- Bot handlers -----
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -207,14 +208,14 @@ async def cmd_start(message: types.Message):
         "I'm a bot for training German vocabulary.\n"
         "Use /next to get the first card.\n\n"
         "For each card choose:\n"
-        "• I know – if you remember the word\n"
-        "• I don't know – if you don't\n"
-        "• I was wrong – if you realise your last answer was wrong.\n\n"
+        "• ✅ *I know* – if you remember the word\n"
+        "• ❌ *I don't know* – if you don't\n"
+        "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
         "You can also use:\n"
         "• /mistakes – to see your latest mistakes\n"
         "• /stats – to see your current statistics."
     )
-    await safe_answer_message(message, text)
+    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.message(Command("next"))
@@ -239,7 +240,7 @@ async def cmd_mistakes(message: types.Message):
         await message.answer("Sorry, this bot is currently in private beta.")
         return
 
-    await send_mistakes_to_user(message.from_user.id, limit=50)
+    await send_mistakes_to_user(message.from_user.id, limit=60)
 
 
 @dp.message(Command("stats"))
@@ -253,14 +254,13 @@ async def cmd_stats(message: types.Message):
     s = await get_stats(user_id)
 
     text = (
-        "📊 Your stats\n\n"
-        f"• Total words in deck: {s['total_words']}\n"
-        f"• Words due now: {s['due_now']}\n"
-        f"• Well-known words (progress ≥ 5): {s['well_known']}\n"
-        f"• Total mistakes logged: {s['mistakes_total']}"
+        "📊 *Your stats*\n\n"
+        f"• Total words in deck: *{s['total_words']}*\n"
+        f"• Words due now: *{s['due_now']}*\n"
+        f"• Well-known words (progress ≥ 5): *{s['well_known']}*\n"
+        f"• Total mistakes logged: *{s['mistakes_total']}*"
     )
-
-    await safe_answer_message(message, text)
+    await message.answer(sanitize_text(text), parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.callback_query(F.data.startswith("ans"))
@@ -288,13 +288,16 @@ async def handle_answer(callback: types.CallbackQuery):
         old_progress = row["progress"]
         await decrement_progress(last_id)
         await log_mistake(user_id, last_id)
-        new_progress = max(0, old_progress - 1)
+
+        # При decrement_progress прогресс уже скорректирован, пересчитаем:
+        row2 = await get_word_by_id(last_id)
+        new_progress = row2["progress"] if row2 else max(0, old_progress - 1)
 
         text = (
             "🔁 Previous word corrected.\n"
-            f"📉 Progress -1 = {new_progress}"
+            f"📉 Progress decreased, new value = {new_progress}"
         )
-        await safe_answer_message(callback.message, text)
+        await callback.message.answer(sanitize_text(text))
         await callback.answer()
         return
 
@@ -312,17 +315,17 @@ async def handle_answer(callback: types.CallbackQuery):
         return
 
     user_last_word[user_id] = word_id
-
     old_progress = row["progress"]
 
     if verdict == "know":
         delta = 1
         new_progress = await increment_progress_and_update_due(word_id)
     else:  # "dont"
-        delta = -1
+        delta = -1  # логический знак, реальное уменьшение считает decrement_progress
         await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
-        new_progress = max(0, old_progress - 1)
+        row2 = await get_word_by_id(word_id)
+        new_progress = row2["progress"] if row2 else max(0, old_progress - 1)
 
     sign = "+" if delta > 0 else "-"
 
@@ -333,10 +336,11 @@ async def handle_answer(callback: types.CallbackQuery):
     prev_part = f"{question}\n\n{answer}"
     if example:
         prev_part += f"\n\n{example}"
-    prev_part += f"\n\n📈 Progress {sign}1 = {new_progress}"
+    prev_part += f"\n\n📈 Progress {sign}1 => {new_progress}"
 
     prev_part = sanitize_text(prev_part)
 
+    # next word
     next_row = await get_next_word()
     if not next_row:
         final_text = prev_part + "\n\nNo more words in the database."
@@ -369,9 +373,7 @@ async def handle_answer(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ---------------------------------------------------------------------------
-# FastAPI lifecycle
-# ---------------------------------------------------------------------------
+# ----- FastAPI lifecycle -----
 
 @app.on_event("startup")
 async def on_startup():
@@ -384,9 +386,7 @@ async def root():
     return {"status": "ok", "message": "vocab-bot is running"}
 
 
-# ---------------------------------------------------------------------------
-# Sync endpoints for Google Sheets
-# ---------------------------------------------------------------------------
+# ----- Sync endpoints for Google Sheets -----
 
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
@@ -394,7 +394,7 @@ async def sync_words(payload: SyncWordsRequest):
     Import from Google Sheets.
 
     last_success_ts_ms is given in milliseconds (Date.now()).
-    Inside we store last_success_ts in seconds and compute next_due_ts.
+    Inside we store last_success_ts in seconds.
     mistakes_log: full mistakes history from Log2.
     """
     words: List[Word] = []
@@ -416,10 +416,8 @@ async def sync_words(payload: SyncWordsRequest):
             )
         )
 
-    # rebuild words
     await replace_all_words(words)
 
-    # rebuild mistakes log (if provided)
     entries: list[tuple[int, int, int]] = []
     if payload.mistakes_log:
         for m in payload.mistakes_log:
@@ -442,10 +440,7 @@ async def sync_progress():
     items = []
     for item in word_items_raw:
         ts = item["last_success_ts"]
-        if ts is not None:
-            ts_ms = int(ts * 1000)
-        else:
-            ts_ms = None
+        ts_ms = int(ts * 1000) if ts is not None else None
         items.append(
             {
                 "sheet_row": item["sheet_row"],
@@ -471,9 +466,7 @@ async def sync_progress():
     return {"status": "ok", "items": items, "mistakes_log": mistakes_out}
 
 
-# ---------------------------------------------------------------------------
-# Telegram webhook
-# ---------------------------------------------------------------------------
+# ----- Telegram webhook -----
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
@@ -483,9 +476,7 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
-# ---------------------------------------------------------------------------
-# Daily mistakes cron endpoint
-# ---------------------------------------------------------------------------
+# ----- Daily mistakes cron endpoint -----
 
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
@@ -496,5 +487,5 @@ async def cron_daily_mistakes():
     user_ids = await get_users_with_mistakes()
     for uid in user_ids:
         if is_allowed(uid):
-            await send_mistakes_to_user(uid, limit=50)
+            await send_mistakes_to_user(uid, limit=60)
     return {"status": "ok", "users_notified": len(user_ids)}
