@@ -183,11 +183,8 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
     return text, keyboard
 
 
-async def send_mistakes_to_user(user_id: int, limit: int = 60):
-    """
-    Send last mistakes to a user as separate messages.
-    ВАЖНО: показываем от старых к новым (инвертируем порядок).
-    """
+async def send_mistakes_to_user(user_id: int, limit: int = 80):
+
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
