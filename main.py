@@ -197,7 +197,7 @@ async def send_mistakes_to_user(user_id: int, limit: int = 60):
     await bot.send_message(user_id, "Words you should review:\n")
 
     # rows обычно приходят от новых к старым, поэтому разворачиваем
-    for row in reversed(rows):
+    for row in rows:
         q = row["question"]
         a = row["answer"]
         text = f"{q}\n\n\n{a}"  # две пустые строки между вопросом и ответом
