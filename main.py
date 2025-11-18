@@ -248,7 +248,7 @@ async def cmd_mistakes(message: types.Message):
         await message.answer("Sorry, this bot is currently in private beta.")
         return
 
-    await send_mistakes_to_user(message.from_user.id, limit=60)
+    await send_mistakes_to_user(message.from_user.id, limit=80)
 
 
 @dp.message(Command("stats"))
@@ -501,5 +501,5 @@ async def cron_daily_mistakes():
     user_ids = await get_users_with_mistakes()
     for uid in user_ids:
         if is_allowed(uid):
-            await send_mistakes_to_user(uid, limit=60)
+            await send_mistakes_to_user(uid, limit=80)
     return {"status": "ok", "users_notified": len(user_ids)}
