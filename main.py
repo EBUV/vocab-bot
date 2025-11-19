@@ -495,7 +495,6 @@ async def sync_progress():
 
 # ----- Telegram webhook -----
 
-
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
