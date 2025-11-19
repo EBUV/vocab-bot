@@ -518,3 +518,4 @@ async def get_stats(user_id: int):
         "well_known": well_known,
         "mistakes_total": mistakes_total,
     }
+
