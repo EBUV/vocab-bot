@@ -136,8 +136,9 @@ class WordIn(BaseModel):
 
 class MistakeLogIn(BaseModel):
     user_id: int
-    sheet_row: int
-    ts_ms: int  # timestamp in milliseconds (Date.now)
+    ts_ms: int           # timestamp in milliseconds (Date.now)
+    question: str
+    answer: str
 
 
 class SyncWordsRequest(BaseModel):
@@ -184,7 +185,10 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 80):
-
+    """
+    Отправляет пользователю его последние `limit` ошибок
+    в порядке от старых к новым.
+    """
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
@@ -193,11 +197,11 @@ async def send_mistakes_to_user(user_id: int, limit: int = 80):
     # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
-    # rows обычно приходят от новых к старым, поэтому разворачиваем
+    # Каждое слово отдельным сообщением: вопрос, две пустые строки, ответ
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"  # две пустые строки между вопросом и ответом
+        text = f"{q}\n\n\n{a}"
         text = sanitize_text(text)
         await bot.send_message(user_id, text)
 
@@ -294,14 +298,16 @@ async def handle_answer(callback: types.CallbackQuery):
             await callback.answer("Previous word not found.", show_alert=False)
             return
 
-        old_progress = row["progress"]
-        await decrement_progress(last_id)
+        old_progress = int(row["progress"])
+        new_progress = await decrement_progress(last_id)
         await log_mistake(user_id, last_id)
-        new_progress = max(0, old_progress - 1)
 
+        delta = old_progress - new_progress
+        if delta < 0:
+            delta = 0  # на всякий случай
         text = (
             "🔁 Previous word corrected.\n"
-            f"📉 Progress -1 = {new_progress}"
+            f"📉 Progress -{delta} = {new_progress}"
         )
         await safe_answer_message(callback.message, text)
         await callback.answer()
@@ -322,18 +328,21 @@ async def handle_answer(callback: types.CallbackQuery):
 
     user_last_word[user_id] = word_id
 
-    old_progress = row["progress"]
+    old_progress = int(row["progress"])
 
     if verdict == "know":
-        delta = 1
         new_progress = await increment_progress_and_update_due(word_id)
+        delta = new_progress - old_progress  # должна быть 1
     else:  # "dont"
-        delta = -1
-        await decrement_progress(word_id)
+        new_progress = await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
-        new_progress = max(0, old_progress - 1)
+        delta = new_progress - old_progress  # будет отрицательным
 
-    sign = "+" if delta > 0 else "-"
+    # текстовое представление изменения прогресса
+    if delta >= 0:
+        sign_part = f"+{delta}"
+    else:
+        sign_part = f"{delta}"  # уже со знаком минус
 
     question = row["question"]
     answer = row["answer"]
@@ -342,7 +351,7 @@ async def handle_answer(callback: types.CallbackQuery):
     prev_part = f"{question}\n\n{answer}"
     if example:
         prev_part += f"\n\n{example}"
-    prev_part += f"\n\n📈 Progress {sign}1 = {new_progress}"
+    prev_part += f"\n\n📈 Progress {sign_part} = {new_progress}"
     prev_part = sanitize_text(prev_part)
 
     next_row = await get_next_word()
@@ -425,12 +434,20 @@ async def sync_words(payload: SyncWordsRequest):
     # rebuild words
     await replace_all_words(words)
 
-    # rebuild mistakes log (если пришёл)
-    entries: list[tuple[int, int, int]] = []
+    # rebuild mistakes log (if provided)
+    # формат: (user_id, question, answer, ts_sec)
+    entries: list[tuple[int, str, str, int]] = []
     if payload.mistakes_log:
         for m in payload.mistakes_log:
             ts_sec = int(m.ts_ms // 1000)
-            entries.append((m.user_id, m.sheet_row, ts_sec))
+            entries.append(
+                (
+                    m.user_id,
+                    m.question,
+                    m.answer,
+                    ts_sec,
+                )
+            )
 
     await replace_all_mistakes(entries)
     return {"status": "ok", "count": len(words), "mistakes": len(entries)}
@@ -467,7 +484,6 @@ async def sync_progress():
         mistakes_out.append(
             {
                 "user_id": row["user_id"],
-                "sheet_row": row["sheet_row"],
                 "ts_ms": int(row["ts"] * 1000),
                 "question": row["question"],
                 "answer": row["answer"],
@@ -489,7 +505,6 @@ async def telegram_webhook(request: Request):
 
 
 # ----- Daily mistakes cron endpoint -----
-
 
 
 @app.get("/cron/daily_mistakes")

@@ -7,7 +7,18 @@ from typing import Optional, List, Tuple, Dict
 
 from config import DB_PATH
 
+
 # ---------- helpers ----------
+
+CREATE_MISTAKES_TABLE = """
+CREATE TABLE IF NOT EXISTS mistakes (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id  INTEGER NOT NULL,
+    question TEXT   NOT NULL,
+    answer   TEXT   NOT NULL,
+    ts       INTEGER NOT NULL
+);
+"""
 
 
 def get_connection() -> sqlite3.Connection:
@@ -76,6 +87,7 @@ async def init_db() -> None:
     conn = get_connection()
     cur = conn.cursor()
 
+    # Основная таблица слов
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS words (
@@ -99,29 +111,13 @@ async def init_db() -> None:
         """
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS mistakes (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER NOT NULL,
-            word_id   INTEGER NOT NULL,
-            sheet_row INTEGER NOT NULL,
-            ts        INTEGER NOT NULL,
-            FOREIGN KEY(word_id) REFERENCES words(id)
-        );
-        """
-    )
+    # Таблица ошибок: больше НИКАКИХ sheet_row/word_id
+    cur.execute(CREATE_MISTAKES_TABLE)
 
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_mistakes_user_ts
         ON mistakes(user_id, ts);
-        """
-    )
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_mistakes_sheet_row
-        ON mistakes(sheet_row);
         """
     )
 
@@ -280,27 +276,38 @@ async def get_due_count() -> int:
 
 async def log_mistake(user_id: int, word_id: int) -> None:
     """
-    Записываем ошибку в mistakes и увеличиваем mistakes_count у слова.
+    Записываем ошибку в mistakes (user_id, question, answer, ts)
+    и увеличиваем mistakes_count у слова.
+
+    ВАЖНО: тут мы больше НЕ используем sheet_row – только текст вопроса/ответа.
     """
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT sheet_row FROM words WHERE id = ?", (word_id,))
+    # Берём текст слова по id
+    cur.execute(
+        "SELECT question, answer FROM words WHERE id = ?",
+        (word_id,),
+    )
     row = cur.fetchone()
     if not row:
         conn.close()
         return
 
-    sheet_row = int(row["sheet_row"])
+    question = row["question"]
+    answer = row["answer"]
     ts = int(time.time())
 
+    # Пишем лог
     cur.execute(
         """
-        INSERT INTO mistakes (user_id, word_id, sheet_row, ts)
+        INSERT INTO mistakes (user_id, question, answer, ts)
         VALUES (?, ?, ?, ?)
         """,
-        (user_id, word_id, sheet_row, ts),
+        (user_id, question, answer, ts),
     )
+
+    # Инкрементируем счётчик ошибок у слова
     cur.execute(
         """
         UPDATE words
@@ -313,23 +320,22 @@ async def log_mistake(user_id: int, word_id: int) -> None:
     conn.commit()
     conn.close()
 
+
 async def get_last_mistakes(user_id: int, limit: int = 80):
     """
     Возвращает последние `limit` ошибок пользователя:
-    сначала выбираем самые новые, затем разворачиваем
-    и отдаём их от старых к новым.
+    - сначала берём самые новые по времени (DESC, LIMIT)
+    - потом разворачиваем список и отдаём от старых к новым
     """
     conn = get_connection()
     cur = conn.cursor()
 
-    # сначала берём последние (самые новые) ошибки
     cur.execute(
         """
-        SELECT w.question, w.answer, m.ts
-        FROM mistakes m
-        JOIN words w ON w.sheet_row = m.sheet_row
-        WHERE m.user_id = ?
-        ORDER BY m.ts DESC
+        SELECT question, answer, ts
+        FROM mistakes
+        WHERE user_id = ?
+        ORDER BY ts DESC
         LIMIT ?
         """,
         (user_id, limit),
@@ -337,12 +343,9 @@ async def get_last_mistakes(user_id: int, limit: int = 80):
     rows = cur.fetchall()
     conn.close()
 
-    # rows сейчас: новые -> старые, разворачиваем
     rows_list = list(rows)
-    rows_list.reverse()
+    rows_list.reverse()  # теперь старые → новые
     return rows_list
-
-
 
 
 async def get_users_with_mistakes() -> List[int]:
@@ -358,16 +361,15 @@ async def get_all_mistakes_for_sync():
     """
     Для экспорта в Google Sheets (Log2).
     Возвращаем список строк с полями:
-      user_id, sheet_row, ts, question, answer
+      user_id, question, answer, ts
     """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT m.user_id, m.sheet_row, m.ts, w.question, w.answer
-        FROM mistakes m
-        JOIN words w ON w.sheet_row = m.sheet_row
-        ORDER BY m.ts ASC, m.id ASC
+        SELECT user_id, question, answer, ts
+        FROM mistakes
+        ORDER BY ts ASC, id ASC
         """
     )
     rows = cur.fetchall()
@@ -375,11 +377,14 @@ async def get_all_mistakes_for_sync():
     return rows
 
 
-async def replace_all_mistakes(entries: List[Tuple[int, int, int]]) -> None:
+async def replace_all_mistakes(entries: List[Tuple[int, str, str, int]]) -> None:
     """
     Полностью пересобираем таблицу mistakes.
-    entries: список кортежей (user_id, sheet_row, ts_sec).
-    После вставки пересчитываем mistakes_count в words.
+    entries: список кортежей (user_id, question, answer, ts_sec).
+
+    ВАЖНО: здесь мы БОЛЬШЕ НЕ трогаем mistakes_count в words.
+    mistakes_count приходит из Google Sheets в replace_all_words,
+    а дальше уже инкрементируется через log_mistake.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -387,38 +392,13 @@ async def replace_all_mistakes(entries: List[Tuple[int, int, int]]) -> None:
     cur.execute("DELETE FROM mistakes")
 
     if entries:
-        # нужно сопоставить sheet_row с id слова
-        # сначала создаём map sheet_row -> id
-        cur.execute("SELECT id, sheet_row FROM words")
-        mapping = {int(r["sheet_row"]): int(r["id"]) for r in cur.fetchall()}
-
-        insert_rows = []
-        for user_id, sheet_row, ts_sec in entries:
-            word_id = mapping.get(sheet_row)
-            if word_id is None:
-                continue
-            insert_rows.append((user_id, word_id, sheet_row, int(ts_sec)))
-
         cur.executemany(
             """
-            INSERT INTO mistakes (user_id, word_id, sheet_row, ts)
+            INSERT INTO mistakes (user_id, question, answer, ts)
             VALUES (?, ?, ?, ?)
             """,
-            insert_rows,
+            entries,
         )
-
-    # пересчёт mistakes_count
-    cur.execute("UPDATE words SET mistakes_count = 0")
-    cur.execute(
-        """
-        UPDATE words
-        SET mistakes_count = (
-            SELECT COUNT(*)
-            FROM mistakes m
-            WHERE m.sheet_row = words.sheet_row
-        )
-        """
-    )
 
     conn.commit()
     conn.close()
@@ -431,6 +411,7 @@ async def replace_all_words(words: List[Word]) -> None:
     Полностью пересобираем таблицу words.
     next_due_ts пересчитываем на основании last_success_ts и progress.
     Если last_success_ts нет – слово считается уже "должником".
+    mistakes_count берём из переданных данных (Google Sheets).
     """
     conn = get_connection()
     cur = conn.cursor()
