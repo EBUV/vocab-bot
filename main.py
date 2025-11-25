@@ -1,4 +1,3 @@
-# main.py
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -117,6 +116,8 @@ app = FastAPI()
 
 # Store last answered word per user (for "I was wrong")
 user_last_word: dict[int, int] = {}
+# Store current question for typed answers
+user_current_word: dict[int, int] = {}
 
 
 # ----- Pydantic models for sync endpoints -----
@@ -136,7 +137,7 @@ class WordIn(BaseModel):
 
 class MistakeLogIn(BaseModel):
     user_id: int
-    ts_ms: int           # timestamp in milliseconds (Date.now)
+    ts_ms: int  # timestamp in milliseconds (Date.now)
     question: str
     answer: str
 
@@ -147,6 +148,68 @@ class SyncWordsRequest(BaseModel):
 
 
 # ----- Helper functions -----
+
+def normalize_answer(s: str) -> str:
+    """
+    Нормализация для сравнения ответов:
+    - обрезаем пробелы по краям
+    - схлопываем множественные пробелы
+    - приводим к нижнему регистру
+    """
+    if s is None:
+        return ""
+    # strip + split/join → убираем лишние пробелы
+    return " ".join(s.strip().split()).lower()
+
+
+def distance_leq1(a: str, b: str) -> int:
+    """
+    Возвращает 0, 1 или 2:
+      0 – строки совпадают;
+      1 – можно привести одну к другой одной операцией
+          вставки/удаления/замены символа;
+      2 – расстояние > 1 (или явно больше).
+    """
+    if a == b:
+        return 0
+
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return 2
+
+    # случай одинаковой длины → считаем количество несовпадений
+    if la == lb:
+        mismatches = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                mismatches += 1
+                if mismatches > 1:
+                    return 2
+        return mismatches  # 1, потому что 0 уже вернули раньше
+
+    # делаем так, чтобы a была не длиннее b
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+
+    # теперь len(b) = len(a)+1
+    i = j = 0
+    mismatches = 0
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        else:
+            mismatches += 1
+            j += 1  # пропускаем один символ в более длинной строке
+            if mismatches > 1:
+                return 2
+
+    # возможный «хвост» в b
+    mismatches += (lb - j)
+    if mismatches <= 1:
+        return mismatches
+    return 2
 
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -185,10 +248,7 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 80):
-    """
-    Отправляет пользователю его последние `limit` ошибок
-    в порядке от старых к новым.
-    """
+    """Send last mistakes (oldest first) to a user as separate messages."""
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
@@ -197,13 +257,39 @@ async def send_mistakes_to_user(user_id: int, limit: int = 80):
     # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
-    # Каждое слово отдельным сообщением: вопрос, две пустые строки, ответ
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"
+        text = f"{q}\n\n\n{a}"  # две пустые строки между вопросом и ответом
         text = sanitize_text(text)
         await bot.send_message(user_id, text)
+
+
+def format_progress_change(old_progress: int, new_progress: int) -> str:
+    """
+    Формирует кусок текста вида '📈 Progress +1 = 6' или '📉 Progress -2 = 5'.
+    """
+    if new_progress == old_progress:
+        return f"📈 Progress = {new_progress}"
+
+    delta = new_progress - old_progress
+    sign = "+" if delta > 0 else "-"
+    magnitude = abs(delta)
+    arrow = "📈" if delta > 0 else "📉"
+    return f"{arrow} Progress {sign}{magnitude} = {new_progress}"
+
+
+async def ask_next_card(msg: types.Message, user_id: int):
+    """Выдаём следующую карточку пользователю."""
+    row = await get_next_word()
+    if not row:
+        await msg.answer("There are no words in the database yet 🙈")
+        return
+
+    due_count = await get_due_count()
+    text, keyboard = build_question_message(row, due_count)
+    user_current_word[user_id] = row["id"]
+    await safe_answer_message(msg, text, reply_markup=keyboard)
 
 
 # ----- Bot handlers -----
@@ -223,9 +309,10 @@ async def cmd_start(message: types.Message):
         "• ✅ *I know* – if you remember the word\n"
         "• ❌ *I don't know* – if you don't\n"
         "• ↩️ *I was wrong* – if you realise your last answer was wrong.\n\n"
-        "You can also use:\n"
-        "• /mistakes – to see your latest mistakes\n"
-        "• /stats – to see your current statistics."
+        "You can also:\n"
+        "• type the answer as text – I'll check it;\n"
+        "• use /mistakes – to see your latest mistakes;\n"
+        "• use /stats – to see your current statistics."
     )
     await safe_answer_message(message, text)
 
@@ -236,14 +323,7 @@ async def cmd_next(message: types.Message):
         await message.answer("Sorry, this bot is currently in private beta.")
         return
 
-    row = await get_next_word()
-    if not row:
-        await message.answer("There are no words in the database yet 🙈")
-        return
-
-    due_count = await get_due_count()
-    text, keyboard = build_question_message(row, due_count)
-    await safe_answer_message(message, text, reply_markup=keyboard)
+    await ask_next_card(message, message.from_user.id)
 
 
 @dp.message(Command("mistakes"))
@@ -298,17 +378,13 @@ async def handle_answer(callback: types.CallbackQuery):
             await callback.answer("Previous word not found.", show_alert=False)
             return
 
-        old_progress = int(row["progress"])
+        old_progress = row["progress"]
         new_progress = await decrement_progress(last_id)
         await log_mistake(user_id, last_id)
 
-        delta = old_progress - new_progress
-        if delta < 0:
-            delta = 0  # на всякий случай
-        text = (
-            "🔁 Previous word corrected.\n"
-            f"📉 Progress -{delta} = {new_progress}"
-        )
+        progress_text = format_progress_change(old_progress, new_progress)
+        text = f"🔁 Previous word corrected.\n{progress_text}"
+
         await safe_answer_message(callback.message, text)
         await callback.answer()
         return
@@ -327,22 +403,17 @@ async def handle_answer(callback: types.CallbackQuery):
         return
 
     user_last_word[user_id] = word_id
+    user_current_word[user_id] = word_id
 
-    old_progress = int(row["progress"])
+    old_progress = row["progress"]
 
     if verdict == "know":
         new_progress = await increment_progress_and_update_due(word_id)
-        delta = new_progress - old_progress  # должна быть 1
     else:  # "dont"
         new_progress = await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
-        delta = new_progress - old_progress  # будет отрицательным
 
-    # текстовое представление изменения прогресса
-    if delta >= 0:
-        sign_part = f"+{delta}"
-    else:
-        sign_part = f"{delta}"  # уже со знаком минус
+    progress_text = format_progress_change(old_progress, new_progress)
 
     question = row["question"]
     answer = row["answer"]
@@ -351,7 +422,7 @@ async def handle_answer(callback: types.CallbackQuery):
     prev_part = f"{question}\n\n{answer}"
     if example:
         prev_part += f"\n\n{example}"
-    prev_part += f"\n\n📈 Progress {sign_part} = {new_progress}"
+    prev_part += f"\n\n{progress_text}"
     prev_part = sanitize_text(prev_part)
 
     next_row = await get_next_word()
@@ -368,6 +439,7 @@ async def handle_answer(callback: types.CallbackQuery):
 
     due_count = await get_due_count()
     next_text, next_keyboard = build_question_message(next_row, due_count)
+    user_current_word[user_id] = next_row["id"]
 
     full_text = prev_part + "\n\n---\n\n" + next_text
     full_text = sanitize_text(full_text)
@@ -384,6 +456,86 @@ async def handle_answer(callback: types.CallbackQuery):
     )
 
     await callback.answer()
+
+
+# ----- Typed answers handler -----
+
+
+@dp.message()
+async def handle_typed_answer(message: types.Message):
+    """
+    Обрабатываем текстовые ответы пользователя:
+    - если это команда ("/...") – ничего не делаем, отдадим другим хендлерам;
+    - иначе считаем, что это ответ на последнюю карточку.
+    """
+    user_id = message.from_user.id
+
+    # не ломаем команды
+    if message.text and message.text.startswith("/"):
+        return
+
+    if not is_allowed(user_id):
+        await message.answer("Sorry, this bot is currently in private beta.")
+        return
+
+    word_id = user_current_word.get(user_id)
+    if not word_id:
+        await message.answer("I don't know which card you are answering. Send /next first.")
+        return
+
+    row = await get_word_by_id(word_id)
+    if not row:
+        await message.answer("Word not found in the database. Try /next.")
+        return
+
+    user_last_word[user_id] = word_id  # чтобы после текстового ответа можно было нажать "I was wrong"
+
+    user_answer_raw = message.text or ""
+    correct_raw = row["answer"] or ""
+
+    user_norm = normalize_answer(user_answer_raw)
+    correct_norm = normalize_answer(correct_raw)
+
+    dist = distance_leq1(user_norm, correct_norm)
+
+    old_progress = row["progress"]
+
+    if dist == 0:
+        verdict = "exact"
+        new_progress = await increment_progress_and_update_due(word_id)
+        progress_text = format_progress_change(old_progress, new_progress)
+        reply = (
+            "✅ Correct!\n\n"
+            f"Your answer: {user_answer_raw}\n"
+            f"Correct answer: {correct_raw}\n\n"
+            f"{progress_text}"
+        )
+    elif dist == 1:
+        verdict = "almost"
+        new_progress = await increment_progress_and_update_due(word_id)
+        progress_text = format_progress_change(old_progress, new_progress)
+        reply = (
+            "🟡 Almost correct (one small typo).\n\n"
+            f"Your answer: {user_answer_raw}\n"
+            f"Correct answer: {correct_raw}\n\n"
+            f"{progress_text}"
+        )
+    else:
+        verdict = "wrong"
+        new_progress = await decrement_progress(word_id)
+        await log_mistake(user_id, word_id)
+        progress_text = format_progress_change(old_progress, new_progress)
+        reply = (
+            "❌ Not correct.\n\n"
+            f"Your answer: {user_answer_raw}\n"
+            f"Correct answer: {correct_raw}\n\n"
+            f"{progress_text}"
+        )
+
+    await safe_answer_message(message, reply)
+
+    # после ответа сразу выдаём следующую карточку
+    await ask_next_card(message, user_id)
 
 
 # ----- FastAPI lifecycle -----
@@ -434,8 +586,7 @@ async def sync_words(payload: SyncWordsRequest):
     # rebuild words
     await replace_all_words(words)
 
-    # rebuild mistakes log (if provided)
-    # формат: (user_id, question, answer, ts_sec)
+    # rebuild mistakes log (если передан)
     entries: list[tuple[int, str, str, int]] = []
     if payload.mistakes_log:
         for m in payload.mistakes_log:
@@ -494,6 +645,7 @@ async def sync_progress():
 
 
 # ----- Telegram webhook -----
+
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
