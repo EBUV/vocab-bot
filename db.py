@@ -213,10 +213,11 @@ async def increment_progress_and_update_due(word_id: int) -> int:
 async def decrement_progress(word_id: int) -> int:
     """
     Уменьшаем прогресс:
-      - если progress > 6 → минус 2
-      - иначе → минус 1
-    last_success_ts сбрасываем в NULL, next_due_ts ставим в now,
-    чтобы слово стало "должником".
+      - если progress > 6 → минус 2 и планируем повтор на завтра;
+      - иначе → минус 1 и делаем слово «должником» прямо сейчас.
+    Для обычных слов last_success_ts сбрасываем в NULL.
+    Для хорошо известных слов подбираем last_success_ts так,
+    чтобы next_due_ts пришёлся примерно на завтра в это время.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -228,22 +229,41 @@ async def decrement_progress(word_id: int) -> int:
         return 0
 
     current = int(row["progress"])
-    step = 2 if current > 6 else 1
-    new_progress = max(0, current - step)
     now = int(time.time())
+
+    if current > 6:
+        # Хорошо известное слово → шаг 2 и повтор завтра
+        step = 2
+        new_progress = max(0, current - step)
+
+        # хотим next_due_ts ≈ завтра в это же время
+        target_due = now + 24 * 60 * 60  # +24 часа
+        interval_sec = progress_to_minutes(new_progress) * 60
+        fake_last_success_ts = target_due - interval_sec
+
+        last_success_ts = fake_last_success_ts
+        next_due_ts = target_due
+    else:
+        # Обычное слово → шаг 1 и должник прямо сейчас
+        step = 1
+        new_progress = max(0, current - step)
+
+        last_success_ts = None
+        next_due_ts = now
 
     cur.execute(
         """
         UPDATE words
-        SET progress = ?, last_success_ts = NULL, next_due_ts = ?
+        SET progress = ?, last_success_ts = ?, next_due_ts = ?
         WHERE id = ?
         """,
-        (new_progress, now, word_id),
+        (new_progress, last_success_ts, next_due_ts, word_id),
     )
 
     conn.commit()
     conn.close()
     return new_progress
+
 
 
 async def get_word_by_id(word_id: int):
