@@ -154,12 +154,21 @@ def normalize_answer(s: str) -> str:
     Нормализация для сравнения ответов:
     - обрезаем пробелы по краям
     - схлопываем множественные пробелы
+    - убираем ТОЛЬКО конечные . ? !
     - приводим к нижнему регистру
     """
     if s is None:
         return ""
-    # strip + split/join → убираем лишние пробелы
-    return " ".join(s.strip().split()).lower()
+
+    # убираем лишние пробелы
+    s = " ".join(s.strip().split())
+
+    # убираем все точки/вопросительные/восклицательные в КОНЦЕ
+    while s and s[-1] in ".!?":
+        s = s[:-1].rstrip()
+
+    # нижний регистр
+    return s.lower()
 
 
 def distance_leq1(a: str, b: str) -> int:
