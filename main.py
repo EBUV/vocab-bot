@@ -1,4 +1,5 @@
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 
@@ -9,10 +10,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from config import BOT_TOKEN, WEBHOOK_PATH
-from config import INTERVALS_PATH
-
-import json
+from config import BOT_TOKEN, WEBHOOK_PATH, INTERVALS_PATH
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -36,7 +34,7 @@ from db import (
 
 # ----- ACCESS CONTROL -----
 
-ALLOWED_USER_IDS = {518129411}  # your Telegram user ID
+ALLOWED_USER_IDS = {518129411}
 
 
 def is_allowed(user_id: int) -> bool:
@@ -45,16 +43,12 @@ def is_allowed(user_id: int) -> bool:
 
 # ----- TEXT SANITIZING (remove problematic chars for Telegram) -----
 
-# удаляем только "странные" управляющие символы, но оставляем \t, \n, \r
 CODES_TO_REMOVE = {c for c in range(0, 32) if c not in (9, 10, 13)}
-CODES_TO_REMOVE.add(127)  # DEL
-
-# иногда проблемы создают спец. разделители строк из Юникода
+CODES_TO_REMOVE.add(127)
 UNICODE_BAD_CODES = {0x2028, 0x2029}
 
 
 def sanitize_text(text: str) -> str:
-    """Remove characters that Telegram may not like (control chars etc.)."""
     if not text:
         return text
     result_chars = []
@@ -67,13 +61,9 @@ def sanitize_text(text: str) -> str:
 
 
 def escape_markdown(text: str) -> str:
-    """
-    Аккуратно экранируем спецсимволы Markdown, чтобы Телега не ругалась.
-    Используем Markdown V2-синтаксис.
-    """
     if not text:
         return text
-    special = r"_*[]()~`>#+-=|{}.!\\"  # набор спецсимволов для MarkdownV2
+    special = r"_*[]()~`>#+-=|{}.!\\"
     escaped = []
     for ch in text:
         if ch in special:
@@ -84,10 +74,6 @@ def escape_markdown(text: str) -> str:
 
 
 async def safe_answer_message(msg: types.Message, text: str, **kwargs):
-    """
-    Пытаемся отправить с MarkdownV2.
-    Если падает – логируем и пробуем без форматирования.
-    """
     try:
         safe_text = sanitize_text(text)
         md_text = escape_markdown(safe_text)
@@ -125,22 +111,19 @@ user_current_word: dict[int, int] = {}
 
 # ----- Pydantic models for sync endpoints -----
 
-
 class WordIn(BaseModel):
     sheet_row: int
     progress: int
     question: str
     answer: str
     example: Optional[str] = None
-    # milliseconds (Date.now()), may be omitted
     last_success_ts_ms: Optional[int] = None
-    # total mistakes count for this word (column I)
     mistakes_count: Optional[int] = 0
 
 
 class MistakeLogIn(BaseModel):
     user_id: int
-    ts_ms: int  # timestamp in milliseconds (Date.now)
+    ts_ms: int
     question: str
     answer: str
 
@@ -148,6 +131,7 @@ class MistakeLogIn(BaseModel):
 class SyncWordsRequest(BaseModel):
     words: List[WordIn]
     mistakes_log: Optional[List[MistakeLogIn]] = None
+    intervals_minutes: Optional[List[int]] = None  # уровни 1..12 из листа bot
 
 
 # ----- Helper functions -----
@@ -157,20 +141,17 @@ def normalize_answer(s: str) -> str:
     Нормализация для сравнения ответов:
     - обрезаем пробелы по краям
     - схлопываем множественные пробелы
-    - убираем ТОЛЬКО конечные . ? !
+    - убираем конечные . ? !
     - приводим к нижнему регистру
     """
     if s is None:
         return ""
 
-    # убираем лишние пробелы
     s = " ".join(s.strip().split())
 
-    # убираем все точки/вопросительные/восклицательные в КОНЦЕ
     while s and s[-1] in ".!?":
         s = s[:-1].rstrip()
 
-    # нижний регистр
     return s.lower()
 
 
@@ -180,7 +161,7 @@ def distance_leq1(a: str, b: str) -> int:
       0 – строки совпадают;
       1 – можно привести одну к другой одной операцией
           вставки/удаления/замены символа;
-      2 – расстояние > 1 (или явно больше).
+      2 – расстояние > 1.
     """
     if a == b:
         return 0
@@ -189,7 +170,6 @@ def distance_leq1(a: str, b: str) -> int:
     if abs(la - lb) > 1:
         return 2
 
-    # случай одинаковой длины → считаем количество несовпадений
     if la == lb:
         mismatches = 0
         for ca, cb in zip(a, b):
@@ -197,14 +177,12 @@ def distance_leq1(a: str, b: str) -> int:
                 mismatches += 1
                 if mismatches > 1:
                     return 2
-        return mismatches  # 1, потому что 0 уже вернули раньше
+        return mismatches
 
-    # делаем так, чтобы a была не длиннее b
     if la > lb:
         a, b = b, a
         la, lb = lb, la
 
-    # теперь len(b) = len(a)+1
     i = j = 0
     mismatches = 0
     while i < la and j < lb:
@@ -213,19 +191,15 @@ def distance_leq1(a: str, b: str) -> int:
             j += 1
         else:
             mismatches += 1
-            j += 1  # пропускаем один символ в более длинной строке
+            j += 1
             if mismatches > 1:
                 return 2
 
-    # возможный «хвост» в b
     mismatches += (lb - j)
-    if mismatches <= 1:
-        return mismatches
-    return 2
+    return 1 if mismatches <= 1 else 2
 
 
 def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Build the question text and inline keyboard for a single word."""
     word_id = row["id"]
     progress = row["progress"]
     question = row["question"]
@@ -260,27 +234,22 @@ def build_question_message(row, due_count: int) -> tuple[str, InlineKeyboardMark
 
 
 async def send_mistakes_to_user(user_id: int, limit: int = 80):
-    """Send last mistakes (oldest first) to a user as separate messages."""
     rows = await get_last_mistakes(user_id, limit=limit)
     if not rows:
         await bot.send_message(user_id, "No mistakes logged yet ✅")
         return
 
-    # Header message
     await bot.send_message(user_id, "Words you should review:\n")
 
     for row in rows:
         q = row["question"]
         a = row["answer"]
-        text = f"{q}\n\n\n{a}"  # две пустые строки между вопросом и ответом
+        text = f"{q}\n\n\n{a}"
         text = sanitize_text(text)
         await bot.send_message(user_id, text)
 
 
 def format_progress_change(old_progress: int, new_progress: int) -> str:
-    """
-    Формирует кусок текста вида '📈 Progress +1 = 6' или '📉 Progress -2 = 5'.
-    """
     if new_progress == old_progress:
         return f"📈 Progress = {new_progress}"
 
@@ -292,7 +261,6 @@ def format_progress_change(old_progress: int, new_progress: int) -> str:
 
 
 async def ask_next_card(msg: types.Message, user_id: int):
-    """Выдаём следующую карточку пользователю."""
     row = await get_next_word()
     if not row:
         await msg.answer("There are no words in the database yet 🙈")
@@ -305,7 +273,6 @@ async def ask_next_card(msg: types.Message, user_id: int):
 
 
 # ----- Bot handlers -----
-
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -349,7 +316,6 @@ async def cmd_mistakes(message: types.Message):
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
-    """Show basic learning statistics."""
     user_id = message.from_user.id
     if not is_allowed(user_id):
         await message.answer("Sorry, this bot is currently in private beta.")
@@ -378,7 +344,7 @@ async def handle_answer(callback: types.CallbackQuery):
 
     data = callback.data
 
-    # ----- "I was wrong" -----
+    # "I was wrong"
     if data == "ans:fix":
         last_id = user_last_word.get(user_id)
         if not last_id:
@@ -401,7 +367,7 @@ async def handle_answer(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # ----- I know / I don't know -----
+    # I know / I don't know
     try:
         _, word_id_str, verdict = data.split(":")
         word_id = int(word_id_str)
@@ -421,7 +387,7 @@ async def handle_answer(callback: types.CallbackQuery):
 
     if verdict == "know":
         new_progress = await increment_progress_and_update_due(word_id)
-    else:  # "dont"
+    else:
         new_progress = await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
 
@@ -472,17 +438,10 @@ async def handle_answer(callback: types.CallbackQuery):
 
 # ----- Typed answers handler -----
 
-
 @dp.message()
 async def handle_typed_answer(message: types.Message):
-    """
-    Обрабатываем текстовые ответы пользователя:
-    - если это команда ("/...") – ничего не делаем, отдадим другим хендлерам;
-    - иначе считаем, что это ответ на последнюю карточку.
-    """
     user_id = message.from_user.id
 
-    # не ломаем команды
     if message.text and message.text.startswith("/"):
         return
 
@@ -500,7 +459,7 @@ async def handle_typed_answer(message: types.Message):
         await message.answer("Word not found in the database. Try /next.")
         return
 
-    user_last_word[user_id] = word_id  # чтобы после текстового ответа можно было нажать "I was wrong"
+    user_last_word[user_id] = word_id
 
     user_answer_raw = message.text or ""
     correct_raw = row["answer"] or ""
@@ -513,7 +472,6 @@ async def handle_typed_answer(message: types.Message):
     old_progress = row["progress"]
 
     if dist == 0:
-        verdict = "exact"
         new_progress = await increment_progress_and_update_due(word_id)
         progress_text = format_progress_change(old_progress, new_progress)
         reply = (
@@ -523,7 +481,6 @@ async def handle_typed_answer(message: types.Message):
             f"{progress_text}"
         )
     elif dist == 1:
-        verdict = "almost"
         new_progress = await increment_progress_and_update_due(word_id)
         progress_text = format_progress_change(old_progress, new_progress)
         reply = (
@@ -533,7 +490,6 @@ async def handle_typed_answer(message: types.Message):
             f"{progress_text}"
         )
     else:
-        verdict = "wrong"
         new_progress = await decrement_progress(word_id)
         await log_mistake(user_id, word_id)
         progress_text = format_progress_change(old_progress, new_progress)
@@ -545,13 +501,10 @@ async def handle_typed_answer(message: types.Message):
         )
 
     await safe_answer_message(message, reply)
-
-    # после ответа сразу выдаём следующую карточку
     await ask_next_card(message, user_id)
 
 
 # ----- FastAPI lifecycle -----
-
 
 @app.on_event("startup")
 async def on_startup():
@@ -566,15 +519,15 @@ async def root():
 
 # ----- Sync endpoints for Google Sheets -----
 
-
 @app.post("/sync/words")
 async def sync_words(payload: SyncWordsRequest):
     """
     Import from Google Sheets.
 
-    last_success_ts_ms is given in milliseconds (Date.now()).
-    Inside we store last_success_ts in seconds and compute next_due_ts.
-    mistakes_log: full mistakes history from Log2.
+    last_success_ts_ms – в мс (Date.now()).
+    Внутри храним last_success_ts в секундах и считаем next_due_ts.
+    mistakes_log – полный лог ошибок (Log2).
+    intervals_minutes – интервалы уровней 1..12 из листа bot.
     """
     words: List[Word] = []
     for w in payload.words:
@@ -594,28 +547,26 @@ async def sync_words(payload: SyncWordsRequest):
                 mistakes_count=w.mistakes_count or 0,
             )
         )
-          # NEW: Save intervals to file
-    if payload.intervals_minutes:
-        data = {i+1: payload.intervals_minutes[i] for i in range(len(payload.intervals_minutes))}
-        data[0] = 1
-        with open(INTERVALS_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
 
-    # rebuild words
+    # сохраняем интервалы в JSON (используется db.progress_to_minutes)
+    if payload.intervals_minutes:
+        try:
+            data = {str(i + 1): int(payload.intervals_minutes[i])
+                    for i in range(len(payload.intervals_minutes))}
+            with open(INTERVALS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            logging.exception("Failed to save intervals file")
+
     await replace_all_words(words)
 
-    # rebuild mistakes log (если передан)
+    # пересобираем mistakes (если передан лог)
     entries: list[tuple[int, str, str, int]] = []
     if payload.mistakes_log:
         for m in payload.mistakes_log:
             ts_sec = int(m.ts_ms // 1000)
             entries.append(
-                (
-                    m.user_id,
-                    m.question,
-                    m.answer,
-                    ts_sec,
-                )
+                (m.user_id, m.question, m.answer, ts_sec)
             )
 
     await replace_all_mistakes(entries)
@@ -664,7 +615,6 @@ async def sync_progress():
 
 # ----- Telegram webhook -----
 
-
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     data = await request.json()
@@ -675,13 +625,8 @@ async def telegram_webhook(request: Request):
 
 # ----- Daily mistakes cron endpoint -----
 
-
 @app.get("/cron/daily_mistakes")
 async def cron_daily_mistakes():
-    """
-    Endpoint to be called by an external scheduler (cron).
-    For each user who has mistakes logged, send them last N mistakes.
-    """
     user_ids = await get_users_with_mistakes()
     for uid in user_ids:
         if is_allowed(uid):
