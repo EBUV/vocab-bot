@@ -8,6 +8,10 @@ if not BOT_TOKEN:
 DB_PATH = "vocab2.db"
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
+
+# intervals for current user (loaded from Google Sheets)
+INTERVALS_PATH = "intervals.json"
+
 # >>> NEW: settings for morning mistakes cron
 # Long random string, желательно поменять на свою
 CRON_SECRET = os.getenv("CRON_SECRET", "CHANGE_ME_TO_SOMETHING_RANDOM")

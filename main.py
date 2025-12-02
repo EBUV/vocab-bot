@@ -10,6 +10,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import BOT_TOKEN, WEBHOOK_PATH
+from config import INTERVALS_PATH
+
+import json
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -591,6 +594,12 @@ async def sync_words(payload: SyncWordsRequest):
                 mistakes_count=w.mistakes_count or 0,
             )
         )
+          # NEW: Save intervals to file
+    if payload.intervals_minutes:
+        data = {i+1: payload.intervals_minutes[i] for i in range(len(payload.intervals_minutes))}
+        data[0] = 1
+        with open(INTERVALS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
 
     # rebuild words
     await replace_all_words(words)
