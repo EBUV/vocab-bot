@@ -85,6 +85,14 @@ def progress_to_minutes(progress: int) -> int:
 
     return _LEVEL_TO_MINUTES.get(progress, _LEVEL_TO_MINUTES.get(12, 0))
 
+def get_intervals_table(max_level: int = 12) -> Dict[int, int]:
+    """
+    Возвращает словарь level -> minutes для уровней 0..max_level,
+    используя текущую функцию progress_to_minutes.
+    Удобно для отладки и команды /intervals.
+    """
+    return {level: progress_to_minutes(level) for level in range(0, max_level + 1)}
+
 
 def compute_next_due_ts(last_success_ts: Optional[int], progress: int) -> int:
     """

@@ -13,7 +13,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import BOT_TOKEN, WEBHOOK_PATH, INTERVALS_PATH
 from pydantic import BaseModel
 from typing import List, Optional
-
 from db import (
     init_db,
     get_next_word,
@@ -30,7 +29,9 @@ from db import (
     get_last_mistakes,
     get_users_with_mistakes,
     get_stats,
+    get_intervals_table,   # <-- вот это добавить
 )
+
 
 # ----- ACCESS CONTROL -----
 
