@@ -25,51 +25,52 @@ DEFAULT_LEVEL_TO_MINUTES: Dict[int, int] = {
     12: 213120,
 }
 
+# актуальные интервалы в памяти
 _LEVEL_TO_MINUTES: Dict[int, int] = DEFAULT_LEVEL_TO_MINUTES.copy()
-_INTERVALS_LOADED = False
 
 
 def load_intervals_from_file() -> None:
     """
-    Однократно пытаемся загрузить интервалы из JSON-файла INTERVALS_PATH.
-    Формат файла: {"1": 1, "2": 30, ...}
-    При ошибке просто используем дефолт.
+    Каждый раз пытаемся загрузить интервалы из JSON-файла INTERVALS_PATH.
+    Формат файла: {"1": 1, "2": 30, ...}.
+    При ошибке — возвращаемся к дефолтным.
     """
-    global _INTERVALS_LOADED, _LEVEL_TO_MINUTES
-    if _INTERVALS_LOADED:
-        return
-
+    global _LEVEL_TO_MINUTES
     try:
         with open(INTERVALS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         new_map: Dict[int, int] = {}
+
         for k, v in data.items():
             try:
                 lvl = int(k)
                 minutes = int(v)
             except (TypeError, ValueError):
                 continue
+            if not (1 <= lvl <= 12):
+                continue
             if minutes < 0:
                 continue
             new_map[lvl] = minutes
 
         if new_map:
-            _LEVEL_TO_MINUTES.update(new_map)
+            merged = DEFAULT_LEVEL_TO_MINUTES.copy()
+            merged.update(new_map)
+            _LEVEL_TO_MINUTES = merged
+        else:
+            _LEVEL_TO_MINUTES = DEFAULT_LEVEL_TO_MINUTES.copy()
     except FileNotFoundError:
-        # файла нет — остаёмся на дефолтных интервалах
-        pass
+        _LEVEL_TO_MINUTES = DEFAULT_LEVEL_TO_MINUTES.copy()
     except Exception:
-        # битый файл — тоже игнорируем
+        # при любой другой ошибке не ломаем бота, оставляем последние значения
         pass
-
-    _INTERVALS_LOADED = True
 
 
 def progress_to_minutes(progress: int) -> int:
     """
     Возвращает интервал в минутах для данного progress.
 
-    Требования:
+    Правила:
       - progress == 0 → без задержки (0 минут, слово сразу "должник")
       - 1..12 → интервалы по таблице (из файла или дефолтные)
       - >12 → использовать интервал как для 12
@@ -259,16 +260,13 @@ async def increment_progress_and_update_due(word_id: int) -> int:
 
 async def decrement_progress(word_id: int) -> int:
     """
-    Уменьшаем прогресс при ошибке/«я не знаю».
+    Уменьшаем прогресс при ошибке / «я не знаю».
 
     Логика:
       - если current_progress > 6 → минус 2;
         и СЛОВО НЕ ЛЕТИТ В НОЛЬ:
           • если new_progress > 0 → делаем так, чтобы слово
             выпало к повторению ПРИМЕРНО через 24 часа.
-            То есть next_due_ts = now + 1 день, а last_success_ts
-            выбирается так, чтобы compute_next_due_ts совпало
-            с этим моментом.
       - иначе (<=6) → минус 1,
         last_success_ts = NULL,
         next_due_ts = now (слово сразу должник).
@@ -301,7 +299,6 @@ async def decrement_progress(word_id: int) -> int:
         next_due_ts = target
     else:
         # для менее знакомых слов или ушедших в 0:
-        # сразу делаем их должниками
         last_success_ts = None
         next_due_ts = now
 
@@ -390,12 +387,11 @@ async def log_mistake(user_id: int, word_id: int) -> None:
 async def get_last_mistakes(user_id: int, limit: int = 80):
     """
     Возвращает последние `limit` ошибок пользователя
-    в ПРАВИЛЬНОМ порядке: от старых к новым.
+    в порядке от старых к новым.
     """
     conn = get_connection()
     cur = conn.cursor()
 
-    # берём самые новые (DESC), ограничиваем limit
     cur.execute(
         """
         SELECT question, answer, ts
@@ -409,7 +405,6 @@ async def get_last_mistakes(user_id: int, limit: int = 80):
     rows = cur.fetchall()
     conn.close()
 
-    # сейчас rows: новые -> старые, разворачиваем
     rows_list = list(rows)
     rows_list.reverse()
     return rows_list
@@ -429,7 +424,6 @@ async def get_all_mistakes_for_sync():
     Для экспорта в Google Sheets (Log2).
     Возвращаем список строк с полями:
       user_id, ts, question, answer
-    (sheet_row нам больше не нужен, всё берём по самому тексту).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -449,9 +443,6 @@ async def replace_all_mistakes(entries: List[Tuple[int, str, str, int]]) -> None
     """
     Полностью пересобираем таблицу mistakes.
     entries: список кортежей (user_id, question, answer, ts_sec).
-
-    per-word mistakes_count мы берём из Google Sheets (колонка I)
-    при replace_all_words, поэтому здесь его НЕ пересчитываем.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -490,7 +481,6 @@ async def replace_all_words(words: List[Word]) -> None:
         if w.last_success_ts is not None:
             next_due = compute_next_due_ts(w.last_success_ts, w.progress)
         else:
-            # если нет успешных ответов – сделать слово должником
             next_due = now
 
         cur.execute(
