@@ -305,6 +305,28 @@ async def cmd_next(message: types.Message):
 
     await ask_next_card(message, message.from_user.id)
 
+@dp.message(Command("intervals"))
+async def cmd_intervals(message: types.Message):
+    """Показать текущие интервалы повторения в минутах для уровней 1–12."""
+    user_id = message.from_user.id
+    if not is_allowed(user_id):
+        await message.answer("Sorry, this bot is currently in private beta.")
+        return
+
+    intervals = get_intervals_table(max_level=12)
+
+    lines = ["📅 *Current intervals (minutes):*"]
+    # уровень 0 – “всегда сейчас”, покажем отдельно
+    zero_minutes = intervals.get(0)
+    if zero_minutes is not None:
+        lines.append(f"0 → всегда сейчас (внутри как {zero_minutes} мин)")
+
+    for level in range(1, 13):
+        minutes = intervals.get(level, 0)
+        lines.append(f"{level} → {minutes}")
+
+    text = "\n".join(lines)
+    await safe_answer_message(message, text)
 
 @dp.message(Command("mistakes"))
 async def cmd_mistakes(message: types.Message):
