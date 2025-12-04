@@ -458,15 +458,148 @@ async def handle_answer(callback: types.CallbackQuery):
 
     await callback.answer()
 
+async def process_iknow_command(message: types.Message, user_id: int):
+    """Обработка текстовой команды 'iknow' — как кнопка I know."""
+    word_id = user_current_word.get(user_id)
+    if not word_id:
+        await message.answer("No active card. Send /next first.")
+        return
 
-# ----- Typed answers handler -----
+    row = await get_word_by_id(word_id)
+    if not row:
+        await message.answer("Word not found in the database. Try /next.")
+        return
+
+    # чтобы потом можно было сказать I was wrong
+    user_last_word[user_id] = word_id
+
+    old_progress = row["progress"]
+    new_progress = await increment_progress_and_update_due(word_id)
+    progress_text = format_progress_change(old_progress, new_progress)
+
+    question = row["question"]
+    answer = row["answer"]
+    example = row["example"]
+
+    text = f"{question}\n\n{answer}"
+    if example:
+        text += f"\n\n{example}"
+    text += f"\n\n{progress_text}"
+    text = sanitize_text(text)
+
+    await safe_answer_message(message, text)
+    # сразу даём следующую карточку
+    await ask_next_card(message, user_id)
+
+
+async def process_idontknow_command(message: types.Message, user_id: int):
+    """Обработка текстовой команды 'idontknow' — как кнопка I don't know."""
+    word_id = user_current_word.get(user_id)
+    if not word_id:
+        await message.answer("No active card. Send /next first.")
+        return
+
+    row = await get_word_by_id(word_id)
+    if not row:
+        await message.answer("Word not found in the database. Try /next.")
+        return
+
+    user_last_word[user_id] = word_id
+
+    old_progress = row["progress"]
+    new_progress = await decrement_progress(word_id)
+    await log_mistake(user_id, word_id)
+    progress_text = format_progress_change(old_progress, new_progress)
+
+    question = row["question"]
+    answer = row["answer"]
+    example = row["example"]
+
+    text = f"{question}\n\n{answer}"
+    if example:
+        text += f"\n\n{example}"
+    text += f"\n\n{progress_text}"
+    text = sanitize_text(text)
+
+    await safe_answer_message(message, text)
+    await ask_next_card(message, user_id)
+
+
+async def process_iwaswrong_command(message: types.Message, user_id: int):
+    """Обработка текстовой команды 'iwaswrong' — как кнопка I was wrong."""
+    last_id = user_last_word.get(user_id)
+    if not last_id:
+        await message.answer("No previous word to fix.")
+        return
+
+    row = await get_word_by_id(last_id)
+    if not row:
+        await message.answer("Previous word not found.")
+        return
+
+    old_progress = row["progress"]
+    new_progress = await decrement_progress(last_id)
+    await log_mistake(user_id, last_id)
+
+    progress_text = format_progress_change(old_progress, new_progress)
+    text = f"🔁 Previous word corrected.\n{progress_text}"
+    await safe_answer_message(message, text)
+
+
+
+# ----- Typed answers & text commands handler -----
+
+
 
 @dp.message()
 async def handle_typed_answer(message: types.Message):
+    """
+    Обрабатываем текстовые сообщения пользователя.
+
+    Варианты:
+    - команды /next, /stats, ... — отдаем другим хендлерам;
+    - специальные текстовые команды:
+        iknow / i know
+        idontknow / i don't know
+        iwaswrong / i was wrong
+      → ведут себя как соответствующие кнопки и удаляются;
+    - всё остальное считаем текстовым ответом на текущую карточку.
+    """
+    raw_text = (message.text or "").strip()
+    if not raw_text:
+        return
+
+    # Команды со слешем ( /next, /stats, ... ) не трогаем
+    if raw_text.startswith("/"):
+        return
+
     user_id = message.from_user.id
 
-    if message.text and message.text.startswith("/"):
-        return
+    # --- Блок специальных текстовых команд ---
+    # Нормализуем: убираем пробелы и апострофы, приводим к нижнему регистру
+    key = raw_text.lower().replace(" ", "").replace("'", "")
+
+    if key in {"iknow", "idontknow", "iwaswrong"}:
+        if not is_allowed(user_id):
+            await message.answer("Sorry, this bot is currently in private beta.")
+            return
+
+        if key == "iknow":
+            await process_iknow_command(message, user_id)
+        elif key == "idontknow":
+            await process_idontknow_command(message, user_id)
+        else:  # iwaswrong
+            await process_iwaswrong_command(message, user_id)
+
+        # Пытаемся удалить сообщение пользователя с командой
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        return  # дальше как ответ не обрабатываем
+
+    # --- Обычный текстовый ответ на карточку ---
 
     if not is_allowed(user_id):
         await message.answer("Sorry, this bot is currently in private beta.")
@@ -482,7 +615,7 @@ async def handle_typed_answer(message: types.Message):
         await message.answer("Word not found in the database. Try /next.")
         return
 
-    user_last_word[user_id] = word_id
+    user_last_word[user_id] = word_id  # чтобы потом можно было нажать "I was wrong"
 
     user_answer_raw = message.text or ""
     correct_raw = row["answer"] or ""
@@ -524,7 +657,10 @@ async def handle_typed_answer(message: types.Message):
         )
 
     await safe_answer_message(message, reply)
+
+    # после ответа сразу выдаём следующую карточку
     await ask_next_card(message, user_id)
+
 
 
 # ----- FastAPI lifecycle -----
